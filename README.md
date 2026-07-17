@@ -8,7 +8,8 @@ Vörwatch watches a Linux server for the signs that usually show up early in a c
 
 It does **not** ban, block, or auto-remediate anything. Every alert is a recommendation for you to review. That's a deliberate design choice, not a missing feature — see (#philosophy).
 
-<img width="994" height="579" alt="image" src="https://github.com/user-attachments/assets/7da10027-f54a-46cf-a11f-f64106ee1d58" />
+<img width="1074" height="530" alt="Screenshot 2026-07-17 183435" src="https://github.com/user-attachments/assets/7cef88c5-a40b-44e5-a814-895bca7bcffc" />
+
 
 ---
 
