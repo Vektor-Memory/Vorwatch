@@ -112,11 +112,11 @@ Scoped deliberately narrow: only your nginx **top-5 source IPs by request count*
 
 ```
 Top 5 source IPs by request count (risk 1-5, 5=critical, via AbuseIPDB):
-    115.186.231.43       35 requests  [risk 1]
-    3.99.128.211         17 requests  [risk 2]
-    216.73.217.6          8 requests  [risk 5]
+    115.186.231.43         35 requests  [risk 1]
+    3.99.128.211           17 requests  [risk 2]
+    216.73.217.6           8 requests  [risk 5]
     34.56.201.30           5 requests  [risk 1]
-    40.223.148.196          4 requests  [risk 1]
+    40.223.148.196         4 requests  [risk 1]
 ```
 
 Note the risk score isn't just a function of volume — a low-traffic IP can still come back as high-risk if AbuseIPDB has real abuse reports against it, which raw request counts alone would never catch.
