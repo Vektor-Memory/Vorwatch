@@ -62,9 +62,9 @@ sudo vorwatch-install
 ## Quick start
 
 ```bash
-vorwatch baseline     # capture current state as "known good"
-vorwatch check         # run one detection pass, log findings
-vorwatch install       # wire up the cron job(s)
+vorwatch baseline       # capture current state as "known good"
+vorwatch check          # run one detection pass, log findings
+vorwatch install        # wire up the cron job(s)
 vorwatch status         # confirm everything's live
 vorwatch report today   # see what's happened
 ```
