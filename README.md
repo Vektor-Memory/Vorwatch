@@ -10,6 +10,8 @@ It does **not** ban, block, or auto-remediate anything. Every alert is a recomme
 
 ---
 
+<img width="994" height="579" alt="image" src="https://github.com/user-attachments/assets/15096ccf-e447-4e94-863e-37d1fba3228b" />
+
 ## Features
 
 - **File integrity monitoring** — SHA-256 baseline of critical files (`sshd_config`, `passwd`, `shadow`, `crontab`, `nginx.conf`, `authorized_keys`), alerts on any change
