@@ -46,3 +46,28 @@ VORWATCH_CRON_SCHEDULE="*/15 * * * *"
 # VORWATCH_EMAIL_FREQUENCY="monday"          # daily | monday
 # VORWATCH_EMAIL_CRON=""                     # raw cron override, optional
 # VORWATCH_EMAIL_URGENT_COOLDOWN_HOURS=4
+
+# --- Optional: package vulnerability scanning (OSV.dev, no API key) ---
+# On by default. Needs python3. Scans your installed package list in
+# one batched HTTP call, cached for VULN_CACHE_TTL_HOURS.
+# VORWATCH_VULN_SCAN="true"
+# VORWATCH_VULN_CACHE_TTL_HOURS=24
+# VORWATCH_VULN_REPORT_MAX=15
+# VORWATCH_VULN_IDS_PER_PKG=8
+
+# --- Optional: rootkit/backdoor scanning ---
+# On by default, but a no-op unless chkrootkit or rkhunter is installed.
+# Rate-limited to once per ROOTKIT_SCAN_HOURS regardless of check cadence.
+# VORWATCH_ROOTKIT_SCAN="true"
+# VORWATCH_ROOTKIT_SCAN_HOURS=24
+
+# --- Optional: CIS-style hardening spot-checks ---
+# On by default. sshd config + critical file permission checks. Only
+# re-alerts when findings change, not on every check.
+# VORWATCH_CIS_CHECKS="true"
+
+# --- Optional: DNS query anomaly detection ---
+# Off by default (unset). Point at a resolver log to enable first-seen
+# domain tracking, the same pattern used for outbound IPs.
+# VORWATCH_DNS_LOG="/var/log/dnsmasq.log"
+# VORWATCH_DNS_WINDOW_LINES=2000

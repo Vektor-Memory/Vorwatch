@@ -4,7 +4,7 @@
 
 Named for Vör, the Old Norse goddess of vigilant awareness, described in the Prose Edda as "wise and inquiring, so that nothing can be concealed from her."
 
-Vörwatch watches a Linux server for the signs that usually show up early in a compromise — new listening ports, changed critical files, first-seen outbound connections, suspicious process trees, SSH attempts from known-bad IPs, and nginx traffic patterns that look like scanning or a volumetric attack — and logs what it finds. Optionally, it can rate the reputation of your busiest visitors and email you when something urgent happens.
+Vörwatch watches a Linux server for the signs that usually show up early in a compromise — new listening ports, changed critical files, first-seen outbound connections, suspicious process trees, SSH attempts from known-bad IPs, nginx traffic patterns that look like scanning or a volumetric attack, vulnerable installed packages, rootkit/backdoor signatures, CIS-style hardening drift, and first-seen outbound DNS queries — and logs what it finds. Optionally, it can rate the reputation of your busiest visitors and email you when something urgent happens.
 
 It does **not** ban, block, or auto-remediate anything. Every alert is a recommendation for you to review. That's a deliberate design choice, not a missing feature — see (#philosophy).
 
@@ -21,8 +21,12 @@ It does **not** ban, block, or auto-remediate anything. Every alert is a recomme
 - **SSH auth cross-reference** — checks recent SSH connection attempts against the threat blocklist
 - **nginx anomaly detection** — high-request-volume and 404-scanning detection per source IP, configurable thresholds
 - **fail2ban + nginx stats** — bundled into one report
+- **Package vulnerability scanning** — checks your installed package list against [OSV.dev](https://osv.dev)'s free vulnerability database in one batched call, no API key needed. Report output is capped (top packages by CVE count, top CVE IDs per package) so an older box with hundreds of historical findings doesn't blow out the report — full detail always lives in the cache file
+- **Rootkit / backdoor scanning** — shells out to `chkrootkit` or `rkhunter` if either is installed, rate-limited independently of the check cadence
+- **CIS-style hardening spot-checks** — sshd config (root login, password auth) and critical file permissions (`/etc/shadow`, `/etc/passwd`), only re-alerts when findings actually change
+- **DNS query anomaly detection** *(optional, off by default)* — first-seen queried domain tracking, same pattern as outbound IPs, if you point it at a resolver log
 - **Optional: IP reputation scoring** — grades your top-5 nginx source IPs 1–5 for risk via [AbuseIPDB](https://www.abuseipdb.com) (bring your own free-tier key)
-- **Optional: email notifications** — urgent alerts (blocklist hits, file tampering, attack patterns) send immediately; everything else lands in a scheduled digest, via [Resend](https://resend.com) (bring your own free-tier key)
+- **Optional: email notifications** — urgent alerts (blocklist hits, file tampering, attack patterns, rootkit hits) send immediately; everything else lands in a scheduled digest, via [Resend](https://resend.com) (bring your own free-tier key)
 - **Zero daemon, zero database** — one bash file, runs off cron, state lives in flat files
 - **Text and JSON report output** — pipe the JSON output into whatever you already use for monitoring
 
@@ -34,9 +38,9 @@ Vörwatch is recommend-only by design. It will never run `ufw deny`, never call 
 
 - Linux with `bash`, coreutils, `iproute2` (`ss`), `procps` (`ps`), `curl`
 - `sudo` access (several checks need root to read process/socket tables)
-- Optional: `fail2ban-client` (for fail2ban stats in reports), `docker` (baseline captures container names if present), `journalctl` (SSH auth cross-reference)
+- Optional: `fail2ban-client` (for fail2ban stats in reports), `docker` (baseline captures container names if present), `journalctl` (SSH auth cross-reference), `python3` (package vulnerability scanning), `chkrootkit` or `rkhunter` (rootkit scanning)
 
-Nothing else. No package manager dependencies, no runtime, no compiled binary.
+Nothing else required for the core checks. No package manager dependencies, no runtime, no compiled binary — the optional checks above degrade gracefully (skip themselves) if their tool isn't installed.
 
 ## Install
 
@@ -105,6 +109,15 @@ All settings live in `/etc/vorwatch/vorwatch.conf` — plain shell variable assi
 | `VORWATCH_EMAIL_FREQUENCY` | `monday` | `daily` or `monday` — controls the scheduled digest cadence |
 | `VORWATCH_EMAIL_CRON` | derived from frequency | Raw cron override for the digest send time |
 | `VORWATCH_EMAIL_URGENT_COOLDOWN_HOURS` | `4` | Minimum hours between repeat urgent emails of the same category |
+| `VORWATCH_VULN_SCAN` | `true` | Package vulnerability scanning via [OSV.dev](https://osv.dev), needs `python3`, no API key |
+| `VORWATCH_VULN_CACHE_TTL_HOURS` | `24` | How often to re-scan (OSV.dev is queried once per TTL window, not per check) |
+| `VORWATCH_VULN_REPORT_MAX` | `15` | Max packages shown in the report before summarizing the rest |
+| `VORWATCH_VULN_IDS_PER_PKG` | `8` | Max CVE/USN IDs shown per package line before summarizing |
+| `VORWATCH_ROOTKIT_SCAN` | `true` | Uses `chkrootkit` or `rkhunter` if installed, skipped entirely if neither is present |
+| `VORWATCH_ROOTKIT_SCAN_HOURS` | `24` | Minimum hours between rootkit scans, independent of the check cadence |
+| `VORWATCH_CIS_CHECKS` | `true` | sshd hardening + critical file permission spot-checks |
+| `VORWATCH_DNS_LOG` | unset | Path to a resolver log (dnsmasq/systemd-resolved) — enables first-seen DNS query tracking |
+| `VORWATCH_DNS_WINDOW_LINES` | `2000` | How many recent DNS log lines each `check` scans |
 
 ## IP reputation scoring
 
@@ -123,14 +136,32 @@ Note the risk score isn't just a function of volume — a low-traffic IP can sti
 
 Get a free key at [abuseipdb.com](https://www.abuseipdb.com) (1000 checks/day, no credit card). Without a key configured, top-5 IPs just show as `unrated` — everything else in the report works normally.
 
+## Package vulnerability scanning
+
+Scans your installed package list against [OSV.dev](https://osv.dev)'s free vulnerability database in a single batched HTTP call — not one call per package. Needs `python3` (used for correct JSON parsing, not bash regex against nested data); skipped entirely if it's not present. Results are cached for `VORWATCH_VULN_CACHE_TTL_HOURS` (default 24h), so repeat runs don't re-hit the API.
+
+OSV.dev returns every historical CVE/USN ever filed against a package version, including old, low-severity, or already-patched-elsewhere entries — on an older or heavily-packaged box that can mean dozens of packages with hundreds of IDs each. The report caps this at both levels: `VORWATCH_VULN_REPORT_MAX` (default 15) packages shown, sorted by CVE count, with a "N more not shown" footer; and `VORWATCH_VULN_IDS_PER_PKG` (default 8) CVE IDs per package line, with a "(+N more)" suffix. The full, uncapped list always lives in the cache file (`vuln-cache.txt` in your `VORWATCH_DIR`). Alerts are a single summary line per scan ("N packages have known vulnerabilities"), not one alert per package.
+
+## Rootkit / backdoor scanning
+
+Shells out to `chkrootkit` or `rkhunter` if either is installed — a no-op otherwise. Rate-limited independently of the 15-minute check cron via `VORWATCH_ROOTKIT_SCAN_HOURS` (default 24h), since a filesystem-wide scan is much heavier than everything else `vorwatch check` does. Any hit is treated as urgent: it's included in the "High Priority" section at the top of every report and, if email is configured, sent immediately.
+
+## CIS-style hardening spot-checks
+
+Not a full CIS benchmark suite — a handful of cheap, high-value checks: `PermitRootLogin` and `PasswordAuthentication` in `sshd_config`, and permissions on `/etc/shadow` and `/etc/passwd`. Only re-alerts when the set of findings actually changes, so a known, unfixed issue doesn't re-fire every 15 minutes forever.
+
+## DNS query anomaly detection
+
+Off by default — not every box runs a local resolver that logs queries. Point `VORWATCH_DNS_LOG` at a resolver log (dnsmasq or systemd-resolved) to enable first-seen domain tracking, the same pattern used for first-seen outbound IPs.
+
 ## Email notifications
 
 Bring your own [Resend](https://resend.com) account (free tier available, no credit card for low volume). You'll need a domain verified in Resend for the `From` address to deliver — Resend's dashboard walks you through the DNS records.
 
 Two tracks:
 
-- **Urgent** — blocklisted outbound connections, blocklisted SSH source IPs, critical file changes, and nginx volume/scan-pattern anomalies email immediately when `vorwatch check` finds them, subject to a per-category cooldown (default 4 hours) so a sustained attack sends one email per category per window, not one every 15 minutes.
-- **Digest** — everything else (new listening ports, suspicious process trees, routine first-seen outbound IPs) lands in a scheduled report, sent weekly (Monday, configurable) or daily, your choice.
+- **Urgent** — blocklisted outbound connections, blocklisted SSH source IPs, critical file changes, nginx volume/scan-pattern anomalies, and rootkit hits email immediately when `vorwatch check` finds them, subject to a per-category cooldown (default 4 hours) so a sustained attack sends one email per category per window, not one every 15 minutes.
+- **Digest** — everything else (new listening ports, suspicious process trees, routine first-seen outbound IPs, CIS findings, vulnerable packages, first-seen DNS queries) lands in a scheduled report, sent weekly (Monday, configurable) or daily, your choice.
 
 If email fails — bad key, network hiccup, whatever — it fails silently and never affects `check` or `report`'s own exit code. Monitoring itself never depends on the email path working.
 
@@ -139,36 +170,50 @@ If email fails — bad key, network hiccup, whatever — it fails silently and n
 ```
 ============================================================
  Vörwatch — VPS Anomaly Detection — Text Report
- Generated: 2026-07-17 02:42:54 UTC
+ Generated: 2026-07-17 08:30:54 UTC
  Range: today
 ============================================================
 
--- High Priority (blocklist matches + integrity changes) --
+-- High Priority (blocklist matches + integrity/rootkit hits) --
   none
 
 -- Alert Summary (today) --
-  Total alerts:           12
+  Total alerts:           103
   New listening ports:    0
   Critical file changed:  0
-  First-seen outbound IP: 12
+  First-seen outbound IP: 103
   Blocklisted outbound:   0
   Suspicious proc tree:   0
   Blocklisted SSH source: 0
+  CIS hardening findings: 0
+  Rootkit findings:       0
+  First-seen DNS queries: 0
+  Vulnerable packages:    0
 
 -- System Vitals --
-  Load average: 0.03, 0.03, 0.00
-  Memory:       2407MB/23988MB used (10%)
-  Disk (/):     29G/146G used (20%)
-  Uptime:       up 9 weeks, 4 days
+  Load average: 0.00, 0.00, 0.05
+  Memory:       2402MB/23988MB used (10%)
+  Disk (/):     46G/146G used (32%)
+  Uptime:       up 9 weeks, 4 days, 20 hours, 42 minutes
 
 -- fail2ban --
   sshd                     total_failed=41605    currently_banned=0      total_banned=1487
 
 -- nginx (current log file only) --
-  Requests logged:        167
+  Requests logged:        449
   Top 5 source IPs by request count (risk 1-5, 5=critical, via AbuseIPDB):
-    115.186.231.43       32 requests  [risk 1]
+    115.186.231.43       35 requests  [risk 1]
   ...
+
+-- Package Vulnerabilities (OSV.dev, cached) --
+  59 package(s), 1625 total CVE/USN ID(s) found (via OSV.dev, includes historical/low-severity entries)
+  linux-oracle 5.15.0.1081.87~20.04.1: UBUNTU-CVE-2012-4542,UBUNTU-CVE-2013-7445,... (+992 more)
+  ...
+  ... and 44 more package(s) not shown (see vuln-cache.txt for the full list)
+  Look up any ID at: https://osv.dev/vulnerability/<ID>
+
+-- Rootkit Scan --
+  Last scan: 3h ago (runs at most every 24h)
 ```
 
 High-priority findings are always at the top; the raw per-IP alert log is always at the bottom. Everything that matters most is closest to your eyes first.

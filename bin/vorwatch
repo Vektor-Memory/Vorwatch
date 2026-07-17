@@ -1,7 +1,7 @@
 #!/bin/bash
 set -uo pipefail
 
-VERSION="0.6.1"
+VERSION="0.7.0"
 
 CONFIG_FILE="${VORWATCH_CONFIG:-/etc/vorwatch/vorwatch.conf}"
 [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
@@ -9,6 +9,7 @@ CONFIG_FILE="${VORWATCH_CONFIG:-/etc/vorwatch/vorwatch.conf}"
 DIR="${VORWATCH_DIR:-$HOME/.vorwatch}"
 BASELINE="$DIR/baseline.txt"
 SEEN_IPS="$DIR/seen-outbound-ips.txt"
+SEEN_DOMAINS="$DIR/seen-domains.txt"
 BLOCKLIST="$DIR/blocklist-cache.txt"
 BLOCKLIST_URL="${VORWATCH_BLOCKLIST_URL:-https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset}"
 BLOCKLIST_AGE_MAX="${VORWATCH_BLOCKLIST_AGE_MAX:-86400}"
@@ -20,13 +21,47 @@ DATE=$(date '+%Y-%m-%d %H:%M:%S %Z')
 
 CRITICAL_FILES="${VORWATCH_CRITICAL_FILES:-/etc/ssh/sshd_config /etc/passwd /etc/shadow /etc/crontab /etc/nginx/nginx.conf $HOME/.ssh/authorized_keys}"
 
+# --- Package vulnerability scanning (optional, no API key needed) ---
+# Queries OSV.dev's free batch API with your installed package list in
+# a single HTTP call (not one call per package), parsed with python3
+# for correctness against nested JSON. Cached for VULN_CACHE_TTL_HOURS
+# so repeat runs don't re-hit the API. Skipped entirely if python3 or
+# /etc/os-release isn't available -- degrades gracefully like the
+# fail2ban/docker checks already do.
+VULN_SCAN="${VORWATCH_VULN_SCAN:-true}"
+VULN_CACHE="$DIR/vuln-cache.txt"
+VULN_CACHE_TTL_HOURS="${VORWATCH_VULN_CACHE_TTL_HOURS:-24}"
+VULN_LAST_FRESH="false"
+
+# --- Rootkit / backdoor signature scanning (optional) ---
+# Shells out to chkrootkit or rkhunter if either is installed, skipped
+# entirely if neither is present. Rate-limited independently of the
+# check cron -- a filesystem-wide scan is heavier than everything else
+# here, so it runs at most once per ROOTKIT_SCAN_HOURS regardless of
+# how often `vorwatch check` itself runs.
+ROOTKIT_SCAN="${VORWATCH_ROOTKIT_SCAN:-true}"
+ROOTKIT_STATE="$DIR/rootkit-last-scan.txt"
+ROOTKIT_SCAN_HOURS="${VORWATCH_ROOTKIT_SCAN_HOURS:-24}"
+
+# --- CIS-style hardening spot-checks (optional, on by default) ---
+# Cheap config/permission checks, not a full CIS benchmark run. Only
+# re-alerts when the set of findings changes, so a known, unfixed
+# issue doesn't re-fire every 15 minutes forever.
+CIS_CHECKS="${VORWATCH_CIS_CHECKS:-true}"
+
+# --- DNS query anomaly detection (optional, off unless a log is set) ---
+# Points at a resolver log (dnsmasq or systemd-resolved) and flags
+# first-seen queried domains, the same pattern used for outbound IPs.
+DNS_LOG="${VORWATCH_DNS_LOG:-}"
+DNS_WINDOW_LINES="${VORWATCH_DNS_WINDOW_LINES:-2000}"
+
 # Email notifications (optional -- everything below is a no-op if
 # VORWATCH_EMAIL_TO is unset). Users add their own recipient(s) via
 # VORWATCH_EMAIL_TO (comma-separated). Urgent alerts (blocklist hits,
-# integrity changes, nginx scan/volume anomalies) bypass the schedule
-# and email immediately, subject to a per-category cooldown so a
-# sustained attack doesn't flood the inbox. Everything else lands in
-# the scheduled digest only.
+# integrity changes, nginx scan/volume anomalies, rootkit hits) bypass
+# the schedule and email immediately, subject to a per-category
+# cooldown so a sustained attack doesn't flood the inbox. Everything
+# else lands in the scheduled digest only.
 EMAIL_TO="${VORWATCH_EMAIL_TO:-}"
 EMAIL_FROM="${VORWATCH_EMAIL_FROM:-Vorwatch <alerts@yourdomain.com>}"
 RESEND_EMAIL_KEY="${VORWATCH_RESEND_API_KEY:-}"
@@ -42,7 +77,7 @@ EMAIL_CRON="${VORWATCH_EMAIL_CRON:-$DEFAULT_EMAIL_CRON}"
 RUN_ALERTS=""
 
 mkdir -p "$DIR"
-touch "$SEEN_IPS" "$LOG"
+touch "$SEEN_IPS" "$SEEN_DOMAINS" "$LOG"
 
 if [ -t 1 ]; then
   C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
@@ -86,11 +121,12 @@ send_email() {
 }
 
 # Scans this run's alerts for urgent categories (blocklist hits,
-# integrity changes, nginx scan/volume anomalies) and emails
-# immediately if any are found and not in cooldown. Per-category
+# integrity changes, nginx scan/volume anomalies, rootkit hits) and
+# emails immediately if any are found and not in cooldown. Per-category
 # cooldown (EMAIL_URGENT_COOLDOWN_HOURS) so a sustained attack sends
 # one email per category per cooldown window, not one every 15 min.
-# New listening ports and suspicious process trees are intentionally
+# New listening ports, suspicious process trees, CIS findings, package
+# vulnerabilities, and first-seen DNS queries are intentionally
 # excluded here -- they go to the scheduled digest only.
 check_urgent_and_notify() {
   [ -n "$EMAIL_TO" ] || return
@@ -106,7 +142,8 @@ check_urgent_and_notify() {
     "blocklist_ssh|KNOWN-BAD IP" \
     "integrity|Critical file hash" \
     "nginx_volume|High request volume" \
-    "nginx_scan|Path-scanning pattern"
+    "nginx_scan|Path-scanning pattern" \
+    "rootkit|Rootkit scan"
   do
     cat="${pair%%|*}"
     pattern="${pair#*|}"
@@ -270,6 +307,98 @@ check_recent_auth_against_blocklist() {
   done <<< "$recent_ips"
 }
 
+# Cheap config/permission spot-checks, not a full CIS benchmark suite.
+# Builds a findings string and only calls alert() when the finding set
+# has changed since the last run -- an unfixed issue won't re-alert
+# every 15 minutes forever, only when something changes (new problem,
+# or the old one gets fixed).
+check_cis_benchmarks() {
+  [ "$CIS_CHECKS" = "true" ] || return
+  local findings=""
+  local sshd_conf="/etc/ssh/sshd_config"
+  if [ -r "$sshd_conf" ] || sudo test -r "$sshd_conf" 2>/dev/null; then
+    local root_login pass_auth
+    root_login=$(sudo grep -iE '^[[:space:]]*PermitRootLogin' "$sshd_conf" 2>/dev/null | tail -1 | awk '{print tolower($2)}')
+    pass_auth=$(sudo grep -iE '^[[:space:]]*PasswordAuthentication' "$sshd_conf" 2>/dev/null | tail -1 | awk '{print tolower($2)}')
+    [ "$root_login" = "yes" ] && findings="${findings}PermitRootLogin is 'yes' in sshd_config (recommend: no or prohibit-password)
+"
+    [ "$pass_auth" = "yes" ] && findings="${findings}PasswordAuthentication is 'yes' in sshd_config (recommend: no, use key-only auth)
+"
+  fi
+
+  local perm
+  if [ -e /etc/shadow ]; then
+    perm=$(stat -c '%a' /etc/shadow 2>/dev/null || sudo stat -c '%a' /etc/shadow 2>/dev/null)
+    if [ -n "$perm" ] && [ "$perm" != "640" ] && [ "$perm" != "600" ]; then
+      findings="${findings}/etc/shadow has permissions $perm (expected 600 or 640)
+"
+    fi
+  fi
+  if [ -e /etc/passwd ]; then
+    perm=$(stat -c '%a' /etc/passwd 2>/dev/null)
+    if [ -n "$perm" ] && [ "$perm" != "644" ]; then
+      findings="${findings}/etc/passwd has permissions $perm (expected 644)
+"
+    fi
+  fi
+
+  findings="${findings%$'\n'}"
+
+  local state_file="$DIR/cis-state.txt"
+  local prev
+  prev=$(cat "$state_file" 2>/dev/null || true)
+  if [ "$findings" != "$prev" ]; then
+    echo "$findings" > "$state_file"
+    [ -n "$findings" ] && alert "CIS hardening check(s) failed: $(echo "$findings" | tr '\n' ' | ')"
+  fi
+}
+
+# Shells out to chkrootkit or rkhunter if either is installed. Rate
+# limited to once per ROOTKIT_SCAN_HOURS via a timestamp file, so it's
+# safe to call this from every `check` run without actually scanning
+# the filesystem every 15 minutes.
+check_rootkit() {
+  [ "$ROOTKIT_SCAN" = "true" ] || return
+  touch "$ROOTKIT_STATE"
+  local now last_run age_h
+  now=$(date +%s)
+  last_run=$(tail -1 "$ROOTKIT_STATE" 2>/dev/null)
+  if [ -n "$last_run" ]; then
+    age_h=$(( (now - last_run) / 3600 ))
+    [ "$age_h" -lt "$ROOTKIT_SCAN_HOURS" ] && return
+  fi
+  echo "$now" > "$ROOTKIT_STATE"
+
+  if command -v chkrootkit >/dev/null 2>&1; then
+    local hits
+    hits=$(sudo timeout 300 chkrootkit 2>/dev/null | grep "INFECTED" || true)
+    [ -n "$hits" ] && alert "Rootkit scan (chkrootkit) found possible infection(s): $(echo "$hits" | tr '\n' ' | ')"
+  elif command -v rkhunter >/dev/null 2>&1; then
+    local hits
+    hits=$(sudo timeout 300 rkhunter --check --skip-keypress --report-warnings-only 2>/dev/null || true)
+    [ -n "$hits" ] && alert "Rootkit scan (rkhunter) reported warning(s): $(echo "$hits" | tr '\n' ' | ')"
+  fi
+}
+
+# Tracks first-seen queried domains from a resolver log, the same
+# pattern used for first-seen outbound IPs. No-op unless VORWATCH_DNS_LOG
+# points at a readable log file (not every box runs a local resolver
+# that logs queries).
+check_dns_anomalies() {
+  [ -n "$DNS_LOG" ] && [ -r "$DNS_LOG" ] || return
+  local recent domains
+  recent=$(tail -n "$DNS_WINDOW_LINES" "$DNS_LOG" 2>/dev/null)
+  [ -n "$recent" ] || return
+  domains=$(echo "$recent" | grep -oE '([a-zA-Z0-9_-]+\.)+[a-zA-Z]{2,}' | sort -u)
+  while read -r d; do
+    [ -z "$d" ] && continue
+    if ! grep -qF "$d " "$SEEN_DOMAINS" 2>/dev/null; then
+      echo "$d  first_seen=$DATE" >> "$SEEN_DOMAINS"
+      alert "First-seen outbound DNS query: $d (not seen before - review if unexpected)"
+    fi
+  done <<< "$domains"
+}
+
 NGINX_ACCESS_LOG_FOR_CHECK="${VORWATCH_NGINX_LOG:-/var/log/nginx/access.log}"
 NGINX_REQ_THRESHOLD="${VORWATCH_NGINX_REQ_THRESHOLD:-200}"
 NGINX_404_THRESHOLD="${VORWATCH_NGINX_404_THRESHOLD:-20}"
@@ -296,6 +425,30 @@ check_nginx_anomalies() {
   done
 }
 
+json_escape() {
+  sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e ':a;N;$!ba;s/\n/\\n/g'
+}
+
+# Only alerts when a fresh scan actually ran (not a cache hit), so
+# vulnerable-package alerts fire at most once per VULN_CACHE_TTL_HOURS
+# instead of every 15-minute check cycle. Writes a single summary alert
+# rather than one per package -- OSV.dev returns every historical
+# CVE/USN against a package version, which on an older box can mean
+# dozens of packages; one alert line per package would flood the log
+# and the digest email. Full detail always lives in the report and the
+# cache file, this just signals that a fresh scan found something.
+check_vulnerabilities() {
+  [ "$VULN_SCAN" = "true" ] || return
+  local findings
+  findings=$(scan_vulnerabilities)
+  [ "$VULN_LAST_FRESH" = "true" ] || return
+  [ -n "$findings" ] || return
+  local pkg_count cve_total
+  pkg_count=$(echo "$findings" | grep -c .)
+  cve_total=$(echo "$findings" | awk -F': ' '{n=split($2,a,","); t+=n} END{print t+0}')
+  alert "$pkg_count installed package(s) have known vulnerabilities ($cve_total total CVE/USN ID(s)) - see 'vorwatch report' for the list, or https://osv.dev"
+}
+
 cmd_check() {
   RUN_ALERTS=""
   refresh_blocklist
@@ -305,13 +458,13 @@ cmd_check() {
   check_process_tree
   check_recent_auth_against_blocklist
   check_nginx_anomalies
+  check_cis_benchmarks
+  check_rootkit
+  check_dns_anomalies
+  check_vulnerabilities
   prune_seen_ips
   check_urgent_and_notify
   return 0
-}
-
-json_escape() {
-  sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e ':a;N;$!ba;s/\n/\\n/g'
 }
 
 NGINX_ACCESS_LOG="${VORWATCH_NGINX_LOG:-/var/log/nginx/access.log}"
@@ -370,6 +523,105 @@ ip_reputation_score() {
   echo "$level"
 }
 
+# Scans installed packages against OSV.dev's free vulnerability database
+# in a single batched HTTP call (not one call per package), parsed with
+# python3's stdlib json module for correctness against nested response
+# data -- bash regex against arbitrarily nested JSON is fragile enough
+# to produce false pairings, so this leans on python3 instead like the
+# rest of the script leans on coreutils. Cached for VULN_CACHE_TTL_HOURS.
+# Sets VULN_LAST_FRESH=true only when an actual scan ran this call (not
+# a cache hit), so callers can tell the difference.
+scan_vulnerabilities() {
+  [ "$VULN_SCAN" = "true" ] || return
+  VULN_LAST_FRESH="false"
+
+  local now cache_ts age_h
+  now=$(date +%s)
+  if [ -f "$VULN_CACHE" ]; then
+    cache_ts=$(head -1 "$VULN_CACHE" 2>/dev/null | awk '{print $4}')
+    if [ -n "$cache_ts" ]; then
+      age_h=$(( (now - cache_ts) / 3600 ))
+      if [ "$age_h" -lt "$VULN_CACHE_TTL_HOURS" ]; then
+        tail -n +2 "$VULN_CACHE" 2>/dev/null
+        return
+      fi
+    fi
+  fi
+
+  command -v python3 >/dev/null 2>&1 || return
+  [ -r /etc/os-release ] || return
+
+  local pkg_list
+  if command -v dpkg-query >/dev/null 2>&1; then
+    pkg_list=$(dpkg-query -W -f='${Package}\t${Version}\n' 2>/dev/null)
+  elif command -v rpm >/dev/null 2>&1; then
+    pkg_list=$(rpm -qa --queryformat '%{NAME}\t%{VERSION}-%{RELEASE}\n' 2>/dev/null)
+  else
+    return
+  fi
+  [ -n "$pkg_list" ] || return
+
+  VULN_LAST_FRESH="true"
+  local findings
+  findings=$(echo "$pkg_list" | python3 -c '
+import sys, json, urllib.request
+
+pkgs = []
+for line in sys.stdin:
+    line = line.rstrip("\n")
+    if not line or "\t" not in line:
+        continue
+    name, version = line.split("\t", 1)
+    pkgs.append((name, version))
+
+osrelease = {}
+try:
+    with open("/etc/os-release") as f:
+        for line in f:
+            if "=" in line:
+                k, v = line.rstrip().split("=", 1)
+                osrelease[k] = v.strip("\"")
+except Exception:
+    pass
+
+os_id = osrelease.get("ID", "")
+os_ver = osrelease.get("VERSION_ID", "")
+eco_map = {"ubuntu": "Ubuntu:" + os_ver, "debian": "Debian:" + os_ver, "alpine": "Alpine:v" + os_ver}
+ecosystem = eco_map.get(os_id)
+if not ecosystem or not pkgs:
+    sys.exit(0)
+
+pkgs = pkgs[:1000]
+queries = [{"package": {"name": n, "ecosystem": ecosystem}, "version": v} for n, v in pkgs]
+
+try:
+    req = urllib.request.Request(
+        "https://api.osv.dev/v1/querybatch",
+        data=json.dumps({"queries": queries}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=25) as resp:
+        data = json.loads(resp.read().decode())
+except Exception:
+    sys.exit(0)
+
+results = data.get("results", [])
+for (name, version), result in zip(pkgs, results):
+    vulns = (result or {}).get("vulns", [])
+    if vulns:
+        ids = ",".join(v.get("id", "?") for v in vulns)
+        print(name + " " + version + ": " + ids)
+' 2>/dev/null)
+
+  {
+    echo "# cached at $now"
+    echo "$findings"
+  } > "$VULN_CACHE"
+
+  echo "$findings"
+}
+
 report_fail2ban_text() {
   command -v fail2ban-client >/dev/null 2>&1 || return
   local jails
@@ -422,6 +674,58 @@ report_nginx_text() {
   echo "  Top 5 paths returning 404 (scan/probe signal):"
   awk '$9==404 {print $7}' "$NGINX_ACCESS_LOG" 2>/dev/null | sort | uniq -c | sort -rn | head -5 | \
     awk '{printf "    %-40s %s hits\n", $2, $1}'
+  echo
+}
+
+report_vulnerabilities_text() {
+  [ "$VULN_SCAN" = "true" ] || return
+  echo "${C_CYAN}-- Package Vulnerabilities (OSV.dev, cached) --${C_RESET}"
+  local findings pkg_count cve_total shown
+  findings=$(scan_vulnerabilities)
+  if [ -n "$findings" ]; then
+    pkg_count=$(echo "$findings" | grep -c .)
+    cve_total=$(echo "$findings" | awk -F': ' '{n=split($2,a,","); t+=n} END{print t+0}')
+    echo "  $pkg_count package(s), $cve_total total CVE/USN ID(s) found (via OSV.dev, includes historical/low-severity entries)"
+    shown="${VORWATCH_VULN_REPORT_MAX:-15}"
+    local ids_shown="${VORWATCH_VULN_IDS_PER_PKG:-8}"
+    echo "$findings" \
+      | awk -F': ' '{n=split($2,a,","); print n"\t"$0}' \
+      | sort -t$'\t' -k1,1 -rn \
+      | cut -f2- \
+      | head -n "$shown" \
+      | awk -F': ' -v ids_shown="$ids_shown" '
+          { n = split($2, a, ",")
+            line = $1 ": "
+            lim = (n < ids_shown ? n : ids_shown)
+            for (i = 1; i <= lim; i++) { line = line a[i] (i < lim ? "," : "") }
+            if (n > ids_shown) line = line " (+" (n - ids_shown) " more)"
+            print line
+          }' \
+      | sed 's/^/  /'
+    if [ "$pkg_count" -gt "$shown" ]; then
+      echo "  ... and $(( pkg_count - shown )) more package(s) not shown (see $VULN_CACHE for the full list)"
+    fi
+    echo "  Look up any ID at: https://osv.dev/vulnerability/<ID>"
+  else
+    echo "  none found (or python3/os-release unavailable, or scan not yet run)"
+  fi
+  echo
+}
+
+report_rootkit_text() {
+  [ "$ROOTKIT_SCAN" = "true" ] || return
+  command -v chkrootkit >/dev/null 2>&1 || command -v rkhunter >/dev/null 2>&1 || return
+  echo "${C_CYAN}-- Rootkit Scan --${C_RESET}"
+  if [ -f "$ROOTKIT_STATE" ]; then
+    local last_run age_h
+    last_run=$(tail -1 "$ROOTKIT_STATE" 2>/dev/null)
+    if [ -n "$last_run" ]; then
+      age_h=$(( ($(date +%s) - last_run) / 3600 ))
+      echo "  Last scan: ${age_h}h ago (runs at most every ${ROOTKIT_SCAN_HOURS}h)"
+    fi
+  else
+    echo "  Not yet run -- next 'vorwatch check' will trigger the first scan"
+  fi
   echo
 }
 
@@ -509,8 +813,8 @@ cmd_report() {
     echo
 
     local hits
-    hits=$(echo "$filtered" | grep -E "threat blocklist|KNOWN-BAD IP|Critical file hash")
-    echo "${C_CYAN}-- High Priority (blocklist matches + integrity changes) --${C_RESET}"
+    hits=$(echo "$filtered" | grep -E "threat blocklist|KNOWN-BAD IP|Critical file hash|Rootkit scan")
+    echo "${C_CYAN}-- High Priority (blocklist matches + integrity/rootkit hits) --${C_RESET}"
     if [ -n "$hits" ]; then
       echo "$hits" | sed "s/^/  ${C_RED}/;s/\$/${C_RESET}/"
     else
@@ -526,11 +830,17 @@ cmd_report() {
     echo "  Blocklisted outbound:   $(echo "$filtered" | grep -c "threat blocklist" || true)"
     echo "  Suspicious proc tree:   $(echo "$filtered" | grep -c "Suspicious process" || true)"
     echo "  Blocklisted SSH source: $(echo "$filtered" | grep -c "KNOWN-BAD IP" || true)"
+    echo "  CIS hardening findings: $(echo "$filtered" | grep -c "CIS hardening" || true)"
+    echo "  Rootkit findings:       $(echo "$filtered" | grep -c "Rootkit scan" || true)"
+    echo "  First-seen DNS queries: $(echo "$filtered" | grep -c "first-seen outbound DNS" || true)"
+    echo "  Vulnerable packages:    $(echo "$filtered" | grep -c "known vulnerabilities" || true)"
     echo
 
     report_vitals_text
     report_fail2ban_text
     report_nginx_text
+    report_vulnerabilities_text
+    report_rootkit_text
 
     echo "${C_CYAN}-- Monitor Health --${C_RESET}"
     if [ -f "$BASELINE" ]; then
@@ -601,6 +911,20 @@ cmd_status() {
   else
     warn "No log rotation — run install.sh again, or add /etc/logrotate.d/vorwatch manually"
   fi
+  if [ "$VULN_SCAN" = "true" ]; then
+    if command -v python3 >/dev/null 2>&1; then
+      ok "Package vulnerability scanning enabled (OSV.dev, cached ${VULN_CACHE_TTL_HOURS}h)"
+    else
+      warn "Package vulnerability scanning enabled but python3 not found — scans will be skipped"
+    fi
+  fi
+  if [ "$ROOTKIT_SCAN" = "true" ]; then
+    if command -v chkrootkit >/dev/null 2>&1 || command -v rkhunter >/dev/null 2>&1; then
+      ok "Rootkit scanning enabled (every ${ROOTKIT_SCAN_HOURS}h)"
+    else
+      info "  Rootkit scanning enabled but neither chkrootkit nor rkhunter is installed — skipped"
+    fi
+  fi
   local alert_count
   alert_count=$(wc -l < "$LOG" 2>/dev/null || echo 0)
   info "  $alert_count total alerts logged, $(wc -l < "$SEEN_IPS" 2>/dev/null || echo 0) known outbound IPs (TTL ${SEEN_IP_TTL_DAYS}d)"
@@ -662,11 +986,33 @@ Email config (all optional, set in /etc/vorwatch/vorwatch.conf):
                                     min hours between repeat urgent emails
                                     of the same category (default: 4)
 
+Additional detection layers (all optional, all on by default except DNS):
+  VORWATCH_VULN_SCAN                true|false (default true) - package
+                                     vulnerability scan via OSV.dev, needs
+                                     python3, no API key required
+  VORWATCH_VULN_CACHE_TTL_HOURS     default 24 - how often to re-scan
+  VORWATCH_VULN_REPORT_MAX          default 15 - max packages shown in
+                                     the report before summarizing the rest
+  VORWATCH_VULN_IDS_PER_PKG         default 8 - max CVE/USN IDs shown per
+                                     package line before summarizing
+  VORWATCH_ROOTKIT_SCAN             true|false (default true) - uses
+                                     chkrootkit or rkhunter if installed,
+                                     skipped entirely if neither is present
+  VORWATCH_ROOTKIT_SCAN_HOURS       default 24 - min hours between scans
+  VORWATCH_CIS_CHECKS               true|false (default true) - sshd
+                                     hardening + critical file permission
+                                     spot-checks
+  VORWATCH_DNS_LOG                  unset by default - path to a resolver
+                                     log (dnsmasq/systemd-resolved) to
+                                     enable first-seen DNS query tracking
+  VORWATCH_DNS_WINDOW_LINES         default 2000
+
 Urgent alerts (blocklisted outbound/SSH, critical file changes, nginx
-scan/volume anomalies) email immediately regardless of schedule, subject
-to the per-category cooldown above. Everything else (new ports,
-suspicious process trees, routine first-seen IPs) appears in the
-scheduled digest only.
+scan/volume anomalies, rootkit hits) email immediately regardless of
+schedule, subject to the per-category cooldown above. Everything else
+(new ports, suspicious process trees, CIS findings, vulnerable packages,
+first-seen DNS queries, routine first-seen IPs) appears in the scheduled
+digest only.
 HELP_EOF
 }
 
