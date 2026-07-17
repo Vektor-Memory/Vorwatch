@@ -206,10 +206,9 @@ If email fails — bad key, network hiccup, whatever — it fails silently and n
   ...
 
 -- Package Vulnerabilities (OSV.dev, cached) --
-  59 package(s), 1625 total CVE/USN ID(s) found (via OSV.dev, includes historical/low-severity entries)
-  linux-oracle 5.15.0.1081.87~20.04.1: UBUNTU-CVE-2012-4542,UBUNTU-CVE-2013-7445,... (+992 more)
+  1 package(s), 1 total CVE/USN ID(s) found (via OSV.dev, includes historical/low-severity entries)
   ...
-  ... and 44 more package(s) not shown (see vuln-cache.txt for the full list)
+  and 1 more package(s) not shown (see vuln-cache.txt for the full list)
   Look up any ID at: https://osv.dev/vulnerability/<ID>
 
 -- Rootkit Scan --
