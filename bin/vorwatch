@@ -1,0 +1,686 @@
+#!/bin/bash
+set -uo pipefail
+
+VERSION="0.6.1"
+
+CONFIG_FILE="${VORWATCH_CONFIG:-/etc/vorwatch/vorwatch.conf}"
+[ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
+
+DIR="${VORWATCH_DIR:-$HOME/.vorwatch}"
+BASELINE="$DIR/baseline.txt"
+SEEN_IPS="$DIR/seen-outbound-ips.txt"
+BLOCKLIST="$DIR/blocklist-cache.txt"
+BLOCKLIST_URL="${VORWATCH_BLOCKLIST_URL:-https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset}"
+BLOCKLIST_AGE_MAX="${VORWATCH_BLOCKLIST_AGE_MAX:-86400}"
+LOG="$DIR/alerts.log"
+CRONLOG="$DIR/cron.log"
+CRON_SCHEDULE="${VORWATCH_CRON_SCHEDULE:-*/15 * * * *}"
+SEEN_IP_TTL_DAYS="${VORWATCH_SEEN_IP_TTL_DAYS:-90}"
+DATE=$(date '+%Y-%m-%d %H:%M:%S %Z')
+
+CRITICAL_FILES="${VORWATCH_CRITICAL_FILES:-/etc/ssh/sshd_config /etc/passwd /etc/shadow /etc/crontab /etc/nginx/nginx.conf $HOME/.ssh/authorized_keys}"
+
+# Email notifications (optional -- everything below is a no-op if
+# VORWATCH_EMAIL_TO is unset). Users add their own recipient(s) via
+# VORWATCH_EMAIL_TO (comma-separated). Urgent alerts (blocklist hits,
+# integrity changes, nginx scan/volume anomalies) bypass the schedule
+# and email immediately, subject to a per-category cooldown so a
+# sustained attack doesn't flood the inbox. Everything else lands in
+# the scheduled digest only.
+EMAIL_TO="${VORWATCH_EMAIL_TO:-}"
+EMAIL_FROM="${VORWATCH_EMAIL_FROM:-Vorwatch <alerts@yourdomain.com>}"
+RESEND_EMAIL_KEY="${VORWATCH_RESEND_API_KEY:-}"
+EMAIL_URGENT_COOLDOWN_HOURS="${VORWATCH_EMAIL_URGENT_COOLDOWN_HOURS:-4}"
+EMAIL_URGENT_STATE="$DIR/email-urgent-state.txt"
+EMAIL_FREQUENCY="${VORWATCH_EMAIL_FREQUENCY:-monday}"
+case "$EMAIL_FREQUENCY" in
+  daily) DEFAULT_EMAIL_CRON="0 22 * * *" ;;
+  *)     DEFAULT_EMAIL_CRON="0 22 * * 0" ;;  # Sun 22:00 UTC = Mon 08:00 AEST (Brisbane, no DST)
+esac
+EMAIL_CRON="${VORWATCH_EMAIL_CRON:-$DEFAULT_EMAIL_CRON}"
+
+RUN_ALERTS=""
+
+mkdir -p "$DIR"
+touch "$SEEN_IPS" "$LOG"
+
+if [ -t 1 ]; then
+  C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
+  C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_CYAN=$'\033[36m'
+else
+  C_RESET=''; C_BOLD=''; C_DIM=''; C_RED=''; C_GREEN=''; C_YELLOW=''; C_CYAN=''
+fi
+
+ok()    { echo "${C_GREEN}[OK]${C_RESET}   $1"; }
+warn()  { echo "${C_YELLOW}[WARN]${C_RESET} $1"; }
+bad()   { echo "${C_RED}[FAIL]${C_RESET} $1"; }
+info()  { echo "${C_DIM}$1${C_RESET}"; }
+
+alert() {
+  echo "[$DATE] ALERT: $1" | tee -a "$LOG" >/dev/null
+  RUN_ALERTS="${RUN_ALERTS}${1}
+"
+}
+
+# Sends a plain-text email via Resend's REST API. No-op (returns 1) if
+# EMAIL_TO or RESEND_EMAIL_KEY isn't configured. Never blocks or exits
+# the script on failure -- a broken email path shouldn't take down
+# monitoring itself.
+send_email() {
+  local subject="$1" body="$2"
+  [ -n "$EMAIL_TO" ] || return 1
+  [ -n "$RESEND_EMAIL_KEY" ] || return 1
+
+  local subject_esc body_esc to_json
+  subject_esc=$(echo -n "$subject" | json_escape)
+  body_esc=$(echo -n "$body" | json_escape)
+  to_json=$(echo "$EMAIL_TO" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | grep -v '^$' | awk '{printf "\"%s\",", $0}' | sed 's/,$//')
+  [ -n "$to_json" ] || return 1
+
+  curl -s -X POST https://api.resend.com/emails \
+    --max-time 15 \
+    -H "Authorization: Bearer $RESEND_EMAIL_KEY" \
+    -H "Content-Type: application/json" \
+    -d "{\"from\":\"$EMAIL_FROM\",\"to\":[$to_json],\"subject\":\"$subject_esc\",\"text\":\"$body_esc\"}" \
+    >/dev/null 2>&1
+}
+
+# Scans this run's alerts for urgent categories (blocklist hits,
+# integrity changes, nginx scan/volume anomalies) and emails
+# immediately if any are found and not in cooldown. Per-category
+# cooldown (EMAIL_URGENT_COOLDOWN_HOURS) so a sustained attack sends
+# one email per category per cooldown window, not one every 15 min.
+# New listening ports and suspicious process trees are intentionally
+# excluded here -- they go to the scheduled digest only.
+check_urgent_and_notify() {
+  [ -n "$EMAIL_TO" ] || return
+  [ -n "$RUN_ALERTS" ] || return
+  touch "$EMAIL_URGENT_STATE"
+
+  local now to_send=""
+  now=$(date +%s)
+
+  local pair cat pattern matched last_sent age_h
+  for pair in \
+    "blocklist_outbound|threat blocklist" \
+    "blocklist_ssh|KNOWN-BAD IP" \
+    "integrity|Critical file hash" \
+    "nginx_volume|High request volume" \
+    "nginx_scan|Path-scanning pattern"
+  do
+    cat="${pair%%|*}"
+    pattern="${pair#*|}"
+    matched=$(echo "$RUN_ALERTS" | grep -F "$pattern" || true)
+    [ -n "$matched" ] || continue
+
+    last_sent=$(grep "^$cat " "$EMAIL_URGENT_STATE" 2>/dev/null | tail -1 | awk '{print $2}')
+    if [ -n "$last_sent" ]; then
+      age_h=$(( (now - last_sent) / 3600 ))
+      [ "$age_h" -lt "$EMAIL_URGENT_COOLDOWN_HOURS" ] && continue
+    fi
+
+    to_send="${to_send}${matched}
+"
+    grep -v "^$cat " "$EMAIL_URGENT_STATE" 2>/dev/null > "$EMAIL_URGENT_STATE.tmp" || true
+    echo "$cat $now" >> "$EMAIL_URGENT_STATE.tmp"
+    mv "$EMAIL_URGENT_STATE.tmp" "$EMAIL_URGENT_STATE"
+  done
+
+  [ -n "$to_send" ] || return
+  send_email "Vorwatch URGENT - $(hostname) - possible attack activity" "$to_send"
+}
+
+refresh_blocklist() {
+  if [ ! -f "$BLOCKLIST" ] || [ $(( $(date +%s) - $(stat -c %Y "$BLOCKLIST" 2>/dev/null || echo 0) )) -gt "$BLOCKLIST_AGE_MAX" ]; then
+    curl -s --max-time 15 "$BLOCKLIST_URL" -o "$BLOCKLIST.tmp" 2>/dev/null
+    if [ -s "$BLOCKLIST.tmp" ]; then
+      grep -v '^#' "$BLOCKLIST.tmp" > "$BLOCKLIST"
+      rm -f "$BLOCKLIST.tmp"
+    fi
+  fi
+}
+
+ip_in_blocklist() {
+  local ip="$1"
+  [ -f "$BLOCKLIST" ] || return 1
+  awk -v target="$ip" '
+    function ip2int(ip,   a,n) {
+      n = split(ip, a, ".")
+      if (n != 4) return -1
+      return (a[1]*16777216)+(a[2]*65536)+(a[3]*256)+a[4]
+    }
+    BEGIN { t = ip2int(target); found = 0 }
+    {
+      line = $0
+      sub(/#.*/, "", line)
+      gsub(/^[ \t]+|[ \t]+$/, "", line)
+      if (line == "") next
+      if (index(line, "/") > 0) {
+        split(line, parts, "/")
+        net = parts[1]; bits = parts[2] + 0
+      } else {
+        net = line; bits = 32
+      }
+      n = ip2int(net)
+      if (n < 0) next
+      size = 2 ^ (32 - bits)
+      if (t >= n && t < n + size) { found = 1; exit }
+    }
+    END { exit (found ? 0 : 1) }
+  ' "$BLOCKLIST"
+}
+
+hash_critical_files() {
+  for f in $CRITICAL_FILES; do
+    if [ -r "$f" ]; then
+      echo "$(sudo sha256sum "$f" 2>/dev/null || sha256sum "$f" 2>/dev/null)"
+    elif sudo test -r "$f" 2>/dev/null; then
+      echo "$(sudo sha256sum "$f" 2>/dev/null)"
+    fi
+  done
+}
+
+cmd_baseline() {
+  {
+    echo "# captured $DATE"
+    echo "## listening_ports"
+    sudo ss -tlnp 2>/dev/null | awk 'NR>1{print $4}' | sort -u
+    echo "## docker_containers"
+    docker ps --format '{{.Names}}' 2>/dev/null | sort -u
+    echo "## known_process_names"
+    ps -eo comm= | sort -u
+    echo "## file_hashes"
+    hash_critical_files
+  } > "$BASELINE"
+  ok "Baseline captured -> $BASELINE"
+}
+
+check_listening_ports() {
+  [ -f "$BASELINE" ] || return
+  local known current new
+  known=$(sed -n '/## listening_ports/,/## docker_containers/p' "$BASELINE" | grep -v '##')
+  current=$(sudo ss -tlnp 2>/dev/null | awk 'NR>1{print $4}' | sort -u)
+  new=$(comm -13 <(echo "$known" | sort -u) <(echo "$current" | sort -u))
+  [ -n "$new" ] && alert "New listening port(s) not in baseline: $(echo "$new" | tr '\n' ' ')"
+}
+
+check_file_integrity() {
+  [ -f "$BASELINE" ] || return
+  grep -q '## file_hashes' "$BASELINE" || return
+  local known current changed
+  known=$(sed -n '/## file_hashes/,$p' "$BASELINE" | grep -v '##')
+  current=$(hash_critical_files)
+  changed=$(diff <(echo "$known" | awk '{print $2, $1}' | sort) <(echo "$current" | awk '{print $2, $1}' | sort) | grep '^[<>]')
+  [ -n "$changed" ] && alert "Critical file hash changed since baseline: $(echo "$changed" | tr '\n' ' | ')"
+}
+
+check_outbound_first_seen() {
+  local conns
+  conns=$(sudo ss -tnp state established 2>/dev/null | awk 'NR>1{print $4}' | grep -oE '^[0-9.]+' | sort -u)
+  while read -r ip; do
+    [ -z "$ip" ] && continue
+    case "$ip" in 127.*|100.6[4-9].*|100.[7-9][0-9].*|100.1[0-1][0-9].*|10.*|169.254.*) continue ;; esac
+    if ! grep -qF "$ip " "$SEEN_IPS" 2>/dev/null; then
+      echo "$ip  first_seen=$DATE" >> "$SEEN_IPS"
+      if ip_in_blocklist "$ip"; then
+        alert "Outbound connection to NEW IP $ip - this IP is on the public threat blocklist"
+      else
+        alert "Outbound connection to a first-seen IP: $ip (not on blocklist, just new - review)"
+      fi
+    fi
+  done <<< "$conns"
+}
+
+prune_seen_ips() {
+  [ -f "$SEEN_IPS" ] || return
+  local cutoff
+  cutoff=$(date -d "-${SEEN_IP_TTL_DAYS} days" '+%s' 2>/dev/null) || return
+  awk -v cutoff="$cutoff" '
+    {
+      ts = $0; sub(/^.*first_seen=/, "", ts)
+      cmd = "date -d \"" ts "\" +%s 2>/dev/null"
+      cmd | getline epoch; close(cmd)
+      if (epoch == "" || epoch >= cutoff) print
+    }' "$SEEN_IPS" > "$SEEN_IPS.tmp" && mv "$SEEN_IPS.tmp" "$SEEN_IPS"
+}
+
+check_process_tree() {
+  local watched_parents="^(nginx|node|docker-proxy|containerd)$"
+  local suspicious_children="^(bash|sh|dash|python|python3|perl|nc|ncat|curl|wget)$"
+  local suspicious
+  suspicious=$(ps -eo pid=,ppid=,comm= 2>/dev/null | awk -v parents="$watched_parents" -v children="$suspicious_children" '
+      { pid[$1]=$3; ppid[$1]=$2 }
+      END {
+        for (p in pid) {
+          child = pid[p]; parentpid = ppid[p]
+          if (child ~ children && (parentpid in pid) && pid[parentpid] ~ parents) {
+            print "pid="p" comm="child" parent_pid="parentpid" parent_comm="pid[parentpid]
+          }
+        }
+      }')
+  [ -n "$suspicious" ] && alert "Suspicious process parent/child pairing detected: $(echo "$suspicious" | tr '\n' '; ')"
+}
+
+check_recent_auth_against_blocklist() {
+  local recent_ips
+  recent_ips=$(sudo journalctl -u ssh --since "1 hour ago" 2>/dev/null | grep -oE 'from [0-9.]+' | awk '{print $2}' | sort -u)
+  while read -r ip; do
+    [ -z "$ip" ] && continue
+    ip_in_blocklist "$ip" && alert "SSH attempt in the last hour from a KNOWN-BAD IP (public blocklist): $ip"
+  done <<< "$recent_ips"
+}
+
+NGINX_ACCESS_LOG_FOR_CHECK="${VORWATCH_NGINX_LOG:-/var/log/nginx/access.log}"
+NGINX_REQ_THRESHOLD="${VORWATCH_NGINX_REQ_THRESHOLD:-200}"
+NGINX_404_THRESHOLD="${VORWATCH_NGINX_404_THRESHOLD:-20}"
+NGINX_WINDOW_LINES="${VORWATCH_NGINX_WINDOW_LINES:-3000}"
+
+check_nginx_anomalies() {
+  [ -r "$NGINX_ACCESS_LOG_FOR_CHECK" ] || return
+  local recent
+  recent=$(tail -n "$NGINX_WINDOW_LINES" "$NGINX_ACCESS_LOG_FOR_CHECK" 2>/dev/null)
+  [ -n "$recent" ] || return
+
+  echo "$recent" | awk '{print $1}' | sort | uniq -c | sort -rn | \
+    awk -v th="$NGINX_REQ_THRESHOLD" '$1+0 >= th {print $1" "$2}' | \
+  while read -r count ip; do
+    [ -z "$ip" ] && continue
+    alert "High request volume from $ip: $count requests in recent nginx log window (threshold $NGINX_REQ_THRESHOLD) - RECOMMENDATION: review; if malicious, ban manually (e.g. 'sudo ufw deny from $ip', or via your fail2ban nginx jail if one is configured: 'sudo fail2ban-client set <jail> banip $ip')"
+  done
+
+  echo "$recent" | awk '$9==404 {print $1}' | sort | uniq -c | sort -rn | \
+    awk -v th="$NGINX_404_THRESHOLD" '$1+0 >= th {print $1" "$2}' | \
+  while read -r count ip; do
+    [ -z "$ip" ] && continue
+    alert "Path-scanning pattern from $ip: $count distinct 404s in recent nginx log window (threshold $NGINX_404_THRESHOLD) - RECOMMENDATION: review; if malicious, ban manually (e.g. 'sudo ufw deny from $ip', or via your fail2ban nginx jail if one is configured: 'sudo fail2ban-client set <jail> banip $ip')"
+  done
+}
+
+cmd_check() {
+  RUN_ALERTS=""
+  refresh_blocklist
+  check_listening_ports
+  check_file_integrity
+  check_outbound_first_seen
+  check_process_tree
+  check_recent_auth_against_blocklist
+  check_nginx_anomalies
+  prune_seen_ips
+  check_urgent_and_notify
+  return 0
+}
+
+json_escape() {
+  sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e ':a;N;$!ba;s/\n/\\n/g'
+}
+
+NGINX_ACCESS_LOG="${VORWATCH_NGINX_LOG:-/var/log/nginx/access.log}"
+
+ABUSEIPDB_KEY="${VORWATCH_ABUSEIPDB_KEY:-}"
+IP_REP_CACHE="$DIR/ip-reputation-cache.txt"
+IP_REP_CACHE_TTL_DAYS="${VORWATCH_IP_REP_CACHE_TTL_DAYS:-7}"
+
+# Looks up a single IP's abuse confidence via AbuseIPDB and maps it to a
+# 1-5 risk level (5 = most dangerous). File-cached per IP for
+# IP_REP_CACHE_TTL_DAYS so repeat report runs against the same source IPs
+# don't re-hit the API. Only ever called for the nginx top-5 source IPs
+# inside `report` -- never from `check`, and never for the (much larger)
+# first-seen outbound IP list. Returns "unrated" if no key is configured
+# or the lookup fails; never blocks the report.
+ip_reputation_score() {
+  local ip="$1"
+  [ -n "$ABUSEIPDB_KEY" ] || { echo "unrated"; return; }
+
+  local now cached ts score age_days
+  now=$(date +%s)
+  if [ -f "$IP_REP_CACHE" ]; then
+    cached=$(grep "^$ip " "$IP_REP_CACHE" 2>/dev/null | tail -1)
+    if [ -n "$cached" ]; then
+      ts=$(echo "$cached" | awk '{print $2}')
+      score=$(echo "$cached" | awk '{print $3}')
+      age_days=$(( (now - ts) / 86400 ))
+      if [ "$age_days" -lt "$IP_REP_CACHE_TTL_DAYS" ]; then
+        echo "$score"
+        return
+      fi
+    fi
+  fi
+
+  local resp conf level
+  resp=$(curl -s -G --max-time 8 https://api.abuseipdb.com/api/v2/check \
+    --data-urlencode "ipAddress=$ip" -d maxAgeInDays=90 \
+    -H "Key: $ABUSEIPDB_KEY" -H "Accept: application/json" 2>/dev/null)
+  conf=$(echo "$resp" | grep -oE '"abuseConfidenceScore":[0-9]+' | grep -oE '[0-9]+$')
+
+  if [ -z "$conf" ]; then
+    echo "unrated"
+    return
+  fi
+
+  if   [ "$conf" -ge 85 ]; then level=5
+  elif [ "$conf" -ge 60 ]; then level=4
+  elif [ "$conf" -ge 40 ]; then level=3
+  elif [ "$conf" -ge 20 ]; then level=2
+  else level=1
+  fi
+
+  grep -v "^$ip " "$IP_REP_CACHE" 2>/dev/null > "$IP_REP_CACHE.tmp"
+  echo "$ip $now $level" >> "$IP_REP_CACHE.tmp"
+  mv "$IP_REP_CACHE.tmp" "$IP_REP_CACHE"
+  echo "$level"
+}
+
+report_fail2ban_text() {
+  command -v fail2ban-client >/dev/null 2>&1 || return
+  local jails
+  jails=$(sudo fail2ban-client status 2>/dev/null | grep 'Jail list' | sed 's/.*://' | tr ',' '\n' | sed 's/^ *//;s/ *$//')
+  [ -n "$jails" ] || return
+  echo "${C_CYAN}-- fail2ban --${C_RESET}"
+  while read -r jail; do
+    [ -z "$jail" ] && continue
+    local detail failed cur_banned tot_banned
+    detail=$(sudo fail2ban-client status "$jail" 2>/dev/null)
+    failed=$(echo "$detail" | grep 'Total failed' | awk -F: '{gsub(/[ \t]/,"",$2); print $2}')
+    cur_banned=$(echo "$detail" | grep 'Currently banned' | awk -F: '{gsub(/[ \t]/,"",$2); print $2}')
+    tot_banned=$(echo "$detail" | grep 'Total banned' | awk -F: '{gsub(/[ \t]/,"",$2); print $2}')
+    printf "  %-24s total_failed=%-8s currently_banned=%-6s total_banned=%s\n" "$jail" "${failed:-0}" "${cur_banned:-0}" "${tot_banned:-0}"
+  done <<< "$jails"
+  echo
+}
+
+report_vitals_text() {
+  echo "${C_CYAN}-- System Vitals --${C_RESET}"
+  local load mem disk uptime_h
+  load=$(uptime 2>/dev/null | sed 's/.*load average: //')
+  mem=$(free -m 2>/dev/null | awk '/^Mem:/{printf "%dMB/%dMB used (%.0f%%)", $3, $2, ($2>0 ? $3/$2*100 : 0)}')
+  disk=$(df -h / 2>/dev/null | awk 'NR==2{print $3"/"$2" used ("$5")"}')
+  uptime_h=$(uptime -p 2>/dev/null || uptime 2>/dev/null | awk -F'( |,)' '{print $3, $4}')
+  echo "  Load average: ${load:-unavailable}"
+  echo "  Memory:       ${mem:-unavailable}"
+  echo "  Disk (/):     ${disk:-unavailable}"
+  echo "  Uptime:       ${uptime_h:-unavailable}"
+  echo
+}
+
+report_nginx_text() {
+  [ -r "$NGINX_ACCESS_LOG" ] || return
+  echo "${C_CYAN}-- nginx (current log file only) --${C_RESET}"
+  local total
+  total=$(wc -l < "$NGINX_ACCESS_LOG" 2>/dev/null || echo 0)
+  echo "  Requests logged:        $total"
+  echo "  Status code breakdown:"
+  awk '{print $9}' "$NGINX_ACCESS_LOG" 2>/dev/null | grep -E '^[0-9]{3}$' | sort | uniq -c | sort -rn | head -6 | \
+    awk '{printf "    %-5s %s\n", $2, $1}'
+  echo "  Top 5 source IPs by request count (risk 1-5, 5=critical, via AbuseIPDB):"
+  awk '{print $1}' "$NGINX_ACCESS_LOG" 2>/dev/null | sort | uniq -c | sort -rn | head -5 | \
+  while read -r count ip; do
+    [ -z "$ip" ] && continue
+    local risk
+    risk=$(ip_reputation_score "$ip")
+    printf "    %-20s %-12s [risk %s]\n" "$ip" "$count requests" "$risk"
+  done
+  echo "  Top 5 paths returning 404 (scan/probe signal):"
+  awk '$9==404 {print $7}' "$NGINX_ACCESS_LOG" 2>/dev/null | sort | uniq -c | sort -rn | head -5 | \
+    awk '{printf "    %-40s %s hits\n", $2, $1}'
+  echo
+}
+
+cmd_report() {
+  local range="all"
+  local as_json="false"
+  local as_email="false"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --range) range="$2"; shift 2 ;;
+      --json) as_json="true"; shift ;;
+      --email) as_email="true"; shift ;;
+      today|24h|7d|all) range="$1"; shift ;;
+      *) shift ;;
+    esac
+  done
+
+  filter_log() {
+    case "$range" in
+      today) grep "^\[$(date '+%Y-%m-%d')" "$LOG" 2>/dev/null ;;
+      24h)
+        awk -v cutoff="$(date -d '24 hours ago' '+%s' 2>/dev/null)" '
+          { ts = substr($0, 2, 19); cmd = "date -d \"" ts "\" +%s 2>/dev/null"; cmd | getline epoch; close(cmd); if (epoch >= cutoff) print }
+        ' "$LOG" 2>/dev/null ;;
+      7d)
+        awk -v cutoff="$(date -d '7 days ago' '+%s' 2>/dev/null)" '
+          { ts = substr($0, 2, 19); cmd = "date -d \"" ts "\" +%s 2>/dev/null"; cmd | getline epoch; close(cmd); if (epoch >= cutoff) print }
+        ' "$LOG" 2>/dev/null ;;
+      *) cat "$LOG" 2>/dev/null ;;
+    esac
+  }
+
+  local filtered total blocklist_age_h blocklist_entries known_ips
+  filtered=$(filter_log)
+  total=$(echo "$filtered" | grep -c "ALERT:" || true)
+  blocklist_age_h=0
+  blocklist_entries=0
+  [ -f "$BLOCKLIST" ] && blocklist_age_h=$(( ($(date +%s) - $(stat -c %Y "$BLOCKLIST")) / 3600 )) && blocklist_entries=$(wc -l < "$BLOCKLIST")
+  known_ips=$(wc -l < "$SEEN_IPS" 2>/dev/null || echo 0)
+
+  if [ "$as_json" = "true" ]; then
+    local new_ports first_seen blocked_out sus_proc blocked_ssh
+    new_ports=$(echo "$filtered" | grep -c "New listening port" || true)
+    first_seen=$(echo "$filtered" | grep -c "first-seen IP:" || true)
+    blocked_out=$(echo "$filtered" | grep -c "threat blocklist" || true)
+    sus_proc=$(echo "$filtered" | grep -c "Suspicious process" || true)
+    blocked_ssh=$(echo "$filtered" | grep -c "KNOWN-BAD IP" || true)
+
+    printf '{\n'
+    printf '  "generated": "%s",\n' "$(echo -n "$DATE" | json_escape)"
+    printf '  "range": "%s",\n' "$range"
+    printf '  "monitor": {\n'
+    printf '    "baseline_captured": %s,\n' "$([ -f "$BASELINE" ] && echo "\"$(head -1 "$BASELINE" | sed 's/# captured //' | json_escape)\"" || echo "null")"
+    printf '    "blocklist_age_hours": %d,\n' "$blocklist_age_h"
+    printf '    "blocklist_entries": %d,\n' "$blocklist_entries"
+    printf '    "known_outbound_ips": %d\n' "$known_ips"
+    printf '  },\n'
+    printf '  "summary": {\n'
+    printf '    "total_alerts": %d,\n' "$total"
+    printf '    "new_listening_ports": %d,\n' "$new_ports"
+    printf '    "first_seen_outbound_ip": %d,\n' "$first_seen"
+    printf '    "blocklisted_outbound": %d,\n' "$blocked_out"
+    printf '    "suspicious_proc_tree": %d,\n' "$sus_proc"
+    printf '    "blocklisted_ssh_source": %d\n' "$blocked_ssh"
+    printf '  },\n'
+    printf '  "recent_alerts": [\n'
+    local first=1
+    while IFS= read -r line; do
+      [ -z "$line" ] && continue
+      [ "$first" -eq 0 ] && printf ',\n'
+      printf '    "%s"' "$(echo -n "$line" | json_escape)"
+      first=0
+    done < <(echo "$filtered" | tail -20)
+    printf '\n  ]\n'
+    printf '}\n'
+    return 0
+  fi
+
+  generate_report_text() {
+    echo "${C_BOLD}============================================================${C_RESET}"
+    echo "${C_BOLD} Vörwatch — VPS Anomaly Detection — Text Report${C_RESET}"
+    echo " Generated: $DATE"
+    echo " Range: $range"
+    echo "${C_BOLD}============================================================${C_RESET}"
+    echo
+
+    local hits
+    hits=$(echo "$filtered" | grep -E "threat blocklist|KNOWN-BAD IP|Critical file hash")
+    echo "${C_CYAN}-- High Priority (blocklist matches + integrity changes) --${C_RESET}"
+    if [ -n "$hits" ]; then
+      echo "$hits" | sed "s/^/  ${C_RED}/;s/\$/${C_RESET}/"
+    else
+      echo "  none"
+    fi
+    echo
+
+    echo "${C_CYAN}-- Alert Summary ($range) --${C_RESET}"
+    echo "  Total alerts:           $total"
+    echo "  New listening ports:    $(echo "$filtered" | grep -c "New listening port" || true)"
+    echo "  Critical file changed:  $(echo "$filtered" | grep -c "Critical file hash" || true)"
+    echo "  First-seen outbound IP: $(echo "$filtered" | grep -c "first-seen IP:" || true)"
+    echo "  Blocklisted outbound:   $(echo "$filtered" | grep -c "threat blocklist" || true)"
+    echo "  Suspicious proc tree:   $(echo "$filtered" | grep -c "Suspicious process" || true)"
+    echo "  Blocklisted SSH source: $(echo "$filtered" | grep -c "KNOWN-BAD IP" || true)"
+    echo
+
+    report_vitals_text
+    report_fail2ban_text
+    report_nginx_text
+
+    echo "${C_CYAN}-- Monitor Health --${C_RESET}"
+    if [ -f "$BASELINE" ]; then
+      echo "  Baseline captured:     $(head -1 "$BASELINE" | sed 's/# captured //')"
+    else
+      echo "  Baseline captured:     NEVER - run: vorwatch baseline"
+    fi
+    if [ -f "$CRONLOG" ]; then
+      echo "  Last cron run (mtime): $(stat -c '%y' "$CRONLOG" 2>/dev/null | cut -d. -f1)"
+    else
+      echo "  Last cron run:         no cron.log found - run: vorwatch install"
+    fi
+    if [ -f "$BLOCKLIST" ]; then
+      echo "  Blocklist age:         ${blocklist_age_h}h old, $blocklist_entries entries"
+    else
+      echo "  Blocklist:             not yet downloaded"
+    fi
+    echo "  Known outbound IPs:    $known_ips"
+    echo
+
+    echo "${C_CYAN}-- Most Recent Alerts (up to 10) --${C_RESET}"
+    if [ -n "$filtered" ]; then
+      echo "$filtered" | tail -10 | sed 's/^/  /'
+    else
+      echo "  none in this range"
+    fi
+    echo
+
+    echo "${C_BOLD}============================================================${C_RESET}"
+  }
+
+  if [ "$as_email" = "true" ]; then
+    local saved_reset="$C_RESET" saved_bold="$C_BOLD" saved_dim="$C_DIM" saved_red="$C_RED" saved_green="$C_GREEN" saved_yellow="$C_YELLOW" saved_cyan="$C_CYAN"
+    C_RESET=''; C_BOLD=''; C_DIM=''; C_RED=''; C_GREEN=''; C_YELLOW=''; C_CYAN=''
+    local email_body
+    email_body=$(generate_report_text)
+    C_RESET="$saved_reset"; C_BOLD="$saved_bold"; C_DIM="$saved_dim"; C_RED="$saved_red"; C_GREEN="$saved_green"; C_YELLOW="$saved_yellow"; C_CYAN="$saved_cyan"
+    send_email "Vorwatch Digest - $(hostname) - $range" "$email_body"
+    return 0
+  fi
+
+  generate_report_text
+  return 0
+}
+
+cmd_status() {
+  echo "${C_BOLD}Vörwatch v$VERSION${C_RESET} — status"
+  echo
+  [ -f "$BASELINE" ] && ok "Baseline captured ($(head -1 "$BASELINE" | sed 's/# captured //'))" || warn "No baseline yet — run: vorwatch baseline"
+  if grep -q '## file_hashes' "$BASELINE" 2>/dev/null; then
+    ok "File-integrity baseline present ($(sed -n '/## file_hashes/,$p' "$BASELINE" | grep -c . ) files watched)"
+  else
+    warn "No file-integrity baseline — run: vorwatch baseline (to add it)"
+  fi
+  if crontab -l 2>/dev/null | grep -q "vorwatch check"; then
+    ok "Cron job installed ($CRON_SCHEDULE)"
+  else
+    warn "Cron job not installed — run: vorwatch install"
+  fi
+  if [ -f "$BLOCKLIST" ]; then
+    local age_h=$(( ($(date +%s) - $(stat -c %Y "$BLOCKLIST")) / 3600 ))
+    if [ "$age_h" -lt 25 ]; then ok "Blocklist fresh (${age_h}h old, $(wc -l < "$BLOCKLIST") entries, CIDR-aware matching)"; else warn "Blocklist stale (${age_h}h old)"; fi
+  else
+    warn "Blocklist not yet downloaded — run: vorwatch check"
+  fi
+  if [ -f /etc/logrotate.d/vorwatch ]; then
+    ok "Log rotation configured"
+  else
+    warn "No log rotation — run install.sh again, or add /etc/logrotate.d/vorwatch manually"
+  fi
+  local alert_count
+  alert_count=$(wc -l < "$LOG" 2>/dev/null || echo 0)
+  info "  $alert_count total alerts logged, $(wc -l < "$SEEN_IPS" 2>/dev/null || echo 0) known outbound IPs (TTL ${SEEN_IP_TTL_DAYS}d)"
+  echo "  data dir: $DIR"
+  echo "  config:   $CONFIG_FILE $([ -f "$CONFIG_FILE" ] || echo '(not found, using defaults)')"
+}
+
+cmd_install() {
+  local self
+  self=$(readlink -f "$0")
+  (
+    crontab -l 2>/dev/null | grep -v "vorwatch check" | grep -v "vorwatch report --range 7d --email"
+    echo "$CRON_SCHEDULE $self check >> \"$CRONLOG\" 2>&1"
+    if [ -n "$EMAIL_TO" ]; then
+      echo "$EMAIL_CRON $self report --range 7d --email >> \"$CRONLOG\" 2>&1"
+    fi
+  ) | crontab -
+  ok "Cron job installed: $CRON_SCHEDULE $self check"
+  if [ -n "$EMAIL_TO" ]; then
+    ok "Email digest scheduled: $EMAIL_CRON (frequency: $EMAIL_FREQUENCY) -> $EMAIL_TO"
+  else
+    info "  No VORWATCH_EMAIL_TO configured - email digest not scheduled"
+  fi
+  [ -f "$BASELINE" ] || { cmd_baseline; }
+}
+
+cmd_uninstall() {
+  crontab -l 2>/dev/null | grep -v "vorwatch check" | grep -v "vorwatch report --range 7d --email" | crontab -
+  ok "Cron job(s) removed"
+}
+
+cmd_help() {
+  cat << 'HELP_EOF'
+vorwatch — Vör's Watch: lightweight VPS anomaly detection
+
+Usage:
+  vorwatch baseline              capture current state as "known good"
+  vorwatch check                 run all detection scenarios, log findings
+  vorwatch report [--range R] [--json] [--email]
+                                  text or JSON report (R = all|today|24h|7d)
+                                  --email sends the text report via Resend
+                                  instead of printing it
+  vorwatch status                one-line health check of the monitor itself
+  vorwatch install               install cron job(s) -- the check cron
+                                  always installs; the email digest cron
+                                  installs only if VORWATCH_EMAIL_TO is set
+  vorwatch uninstall             remove cron job(s)
+  vorwatch help                  this message
+  vorwatch version                print version
+
+Email config (all optional, set in /etc/vorwatch/vorwatch.conf):
+  VORWATCH_EMAIL_TO                comma-separated recipient list
+  VORWATCH_EMAIL_FROM              default: Vorwatch <alerts@yourdomain.com>
+                                    (must be a domain verified in Resend)
+  VORWATCH_RESEND_API_KEY          Resend API key
+  VORWATCH_EMAIL_FREQUENCY         daily | monday (default: monday)
+  VORWATCH_EMAIL_CRON              raw cron override for the digest send time
+  VORWATCH_EMAIL_URGENT_COOLDOWN_HOURS
+                                    min hours between repeat urgent emails
+                                    of the same category (default: 4)
+
+Urgent alerts (blocklisted outbound/SSH, critical file changes, nginx
+scan/volume anomalies) email immediately regardless of schedule, subject
+to the per-category cooldown above. Everything else (new ports,
+suspicious process trees, routine first-seen IPs) appears in the
+scheduled digest only.
+HELP_EOF
+}
+
+cmd_version() {
+  echo "vorwatch $VERSION"
+}
+
+case "${1:-help}" in
+  baseline)  shift; cmd_baseline "$@" ;;
+  check)     shift; cmd_check "$@" ;;
+  report)    shift; cmd_report "$@" ;;
+  status)    shift; cmd_status "$@" ;;
+  install)   shift; cmd_install "$@" ;;
+  uninstall) shift; cmd_uninstall "$@" ;;
+  version|--version|-v) cmd_version ;;
+  help|--help|-h|*) cmd_help ;;
+esac

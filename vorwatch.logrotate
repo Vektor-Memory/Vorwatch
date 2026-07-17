@@ -1,0 +1,19 @@
+# Reference only -- install.sh generates the real /etc/logrotate.d/vorwatch
+# dynamically, using whatever VORWATCH_DIR you chose during setup, since
+# that path isn't known until install time. This file just shows you the
+# shape of what gets written, in case you want to hand-roll it yourself.
+#
+# Rotates vorwatch's growing log files. seen-outbound-ips.txt and
+# baseline.txt are deliberately NOT here -- they're state, not logs;
+# seen-outbound-ips.txt self-prunes via TTL inside `vorwatch check`
+# instead of being truncated on a schedule.
+/home/youruser/.vorwatch/alerts.log
+/home/youruser/.vorwatch/cron.log
+{
+    weekly
+    rotate 8
+    compress
+    missingok
+    notifempty
+    copytruncate
+}

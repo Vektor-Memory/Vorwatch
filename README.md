@@ -10,8 +10,6 @@ It does **not** ban, block, or auto-remediate anything. Every alert is a recomme
 
 ---
 
-<img width="994" height="579" alt="image" src="https://github.com/user-attachments/assets/15096ccf-e447-4e94-863e-37d1fba3228b" />
-
 ## Features
 
 - **File integrity monitoring** — SHA-256 baseline of critical files (`sshd_config`, `passwd`, `shadow`, `crontab`, `nginx.conf`, `authorized_keys`), alerts on any change
@@ -41,7 +39,7 @@ Nothing else. No package manager dependencies, no runtime, no compiled binary.
 ## Install
 
 ```bash
-git clone https://github.com/yourusername/vorwatch.git
+git clone https://github.com/vektormemory/vorwatch.git
 cd vorwatch
 sudo bash install.sh
 ```
@@ -62,9 +60,9 @@ sudo vorwatch-install
 ## Quick start
 
 ```bash
-vorwatch baseline       # capture current state as "known good"
-vorwatch check          # run one detection pass, log findings
-vorwatch install        # wire up the cron job(s)
+vorwatch baseline     # capture current state as "known good"
+vorwatch check         # run one detection pass, log findings
+vorwatch install       # wire up the cron job(s)
 vorwatch status         # confirm everything's live
 vorwatch report today   # see what's happened
 ```
@@ -112,11 +110,11 @@ Scoped deliberately narrow: only your nginx **top-5 source IPs by request count*
 
 ```
 Top 5 source IPs by request count (risk 1-5, 5=critical, via AbuseIPDB):
-    115.186.231.43         35 requests  [risk 1]
-    3.99.128.211           17 requests  [risk 2]
-    216.73.217.6           8 requests  [risk 5]
+    115.186.231.43       35 requests  [risk 1]
+    3.99.128.211         17 requests  [risk 2]
+    216.73.217.6          8 requests  [risk 5]
     34.56.201.30           5 requests  [risk 1]
-    40.223.148.196         4 requests  [risk 1]
+    40.223.148.196          4 requests  [risk 1]
 ```
 
 Note the risk score isn't just a function of volume — a low-traffic IP can still come back as high-risk if AbuseIPDB has real abuse reports against it, which raw request counts alone would never catch.

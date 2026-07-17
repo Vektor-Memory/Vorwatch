@@ -1,0 +1,48 @@
+# /etc/vorwatch/vorwatch.conf
+# Sourced directly by the `vorwatch` script — plain shell variable
+# assignments, no special syntax. Anything left unset falls back to
+# vorwatch's built-in defaults.
+#
+# Prefer running install.sh's interactive wizard over editing this file
+# by hand — it prompts for everything below and writes this file for you.
+
+# Where baseline/alerts/blocklist/state files live.
+# Default: $HOME/.vorwatch -- uncomment and change if you want it
+# somewhere else.
+# VORWATCH_DIR="/home/youruser/vorwatch"
+
+# Public threat intelligence feed used to cross-reference outbound
+# connections and SSH source IPs. FireHOL's level1 netset aggregates
+# Spamhaus DROP, DShield, and other known-malicious ranges — free,
+# no signup, no API key.
+VORWATCH_BLOCKLIST_URL="https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset"
+
+# How old the cached blocklist can get (seconds) before it's re-downloaded.
+VORWATCH_BLOCKLIST_AGE_MAX=86400
+
+# Cron schedule used by `vorwatch install`.
+VORWATCH_CRON_SCHEDULE="*/15 * * * *"
+
+# --- Optional: nginx anomaly detection tuning ---
+# VORWATCH_NGINX_LOG="/var/log/nginx/access.log"
+# VORWATCH_NGINX_REQ_THRESHOLD=200
+# VORWATCH_NGINX_404_THRESHOLD=20
+# VORWATCH_NGINX_WINDOW_LINES=3000
+
+# --- Optional: IP reputation scoring (nginx top-5 source IPs only) ---
+# Free tier at https://www.abuseipdb.com, 1000 checks/day. Leave unset
+# and top-5 IPs just show as "unrated".
+# VORWATCH_ABUSEIPDB_KEY=""
+# VORWATCH_IP_REP_CACHE_TTL_DAYS=7
+
+# --- Optional: email notifications via Resend (https://resend.com) ---
+# Unset VORWATCH_EMAIL_TO disables email entirely (default). Urgent
+# alerts (blocklist hits, file tampering, nginx attack patterns) send
+# immediately; everything else lands in the scheduled digest only.
+# The From address's domain must be verified in your Resend account.
+# VORWATCH_EMAIL_TO="you@example.com,teammate@example.com"
+# VORWATCH_EMAIL_FROM="Vorwatch <alerts@yourdomain.com>"
+# VORWATCH_RESEND_API_KEY=""
+# VORWATCH_EMAIL_FREQUENCY="monday"          # daily | monday
+# VORWATCH_EMAIL_CRON=""                     # raw cron override, optional
+# VORWATCH_EMAIL_URGENT_COOLDOWN_HOURS=4
