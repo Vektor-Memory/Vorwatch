@@ -100,7 +100,7 @@ All settings live in `/etc/vorwatch/vorwatch.conf` — plain shell variable assi
 | `VORWATCH_ABUSEIPDB_KEY` | unset | [AbuseIPDB](https://www.abuseipdb.com) key — enables 1–5 risk scoring on your nginx top-5 source IPs. Free tier: 1000 checks/day. Only called during `report`, never `check`, and results are file-cached for a week — see [IP reputation scoring](#ip-reputation-scoring) |
 | `VORWATCH_IP_REP_CACHE_TTL_DAYS` | `7` | How long a cached reputation score is trusted before re-checking |
 | `VORWATCH_EMAIL_TO` | unset | Comma-separated recipient list. Unset disables email entirely | 
-| `VORWATCH_EMAIL_FROM` | `Vorwatch <hello@yourdomain.com>` | Sender address — its domain must be verified in your Resend account |
+| `VORWATCH_EMAIL_FROM` | `Vorwatch <alerts@yourdomain.com>` | Sender address — its domain must be verified in your Resend account |
 | `VORWATCH_RESEND_API_KEY` | unset | [Resend](https://resend.com) API key |
 | `VORWATCH_EMAIL_FREQUENCY` | `monday` | `daily` or `monday` — controls the scheduled digest cadence |
 | `VORWATCH_EMAIL_CRON` | derived from frequency | Raw cron override for the digest send time |
