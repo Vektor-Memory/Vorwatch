@@ -33,7 +33,7 @@ It does **not** ban, block, or auto-remediate anything. Every alert is a recomme
 
 ## Philosophy
 
-Vörwatch is recommend-only by design. It will never run `ufw deny`, never call `fail2ban-client banip`, never touch iptables. Every alert that suggests an action tells you the exact command to run yourself. This is intentional: automated banning based on heuristics has a real false-positive cost on a single production box, and the unknown risk of unattended firewall changes isn't worth the convenience for most single-server setups. If you want auto-remediation, this isn't that tool — pair it with something like [CrowdSec](https://crowdsec.net) instead.
+Vörwatch is recommend-only by design. It will never run `ufw deny`, never call `fail2ban-client banip`, never touch iptables. Every alert that suggests an action tells you the exact command to run yourself. This is intentional: automated banning based on heuristics has a real false-positive cost on a single production box, and the unknown risk of unattended firewall changes isn't worth the convenience for most single-server setups. If you want auto-remediation, this isn't that tool — pair it with a gui based security suite. 
 
 ## Requirements
 
