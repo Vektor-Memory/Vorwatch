@@ -4,7 +4,7 @@
 
 Named for Vör, the Old Norse goddess of vigilant awareness, described in the Prose Edda as "wise and inquiring, so that nothing can be concealed from her."
 
-Vörwatch watches a Linux server for the signs that usually show up early in a compromise, new listening ports, changed critical files, first-seen outbound connections, suspicious process trees, SSH attempts from known-bad IPs, nginx traffic patterns that look like scanning or a volumetric attack, vulnerable installed packages, rootkit/backdoor signatures, CIS-style hardening drift, and first-seen outbound DNS queries — and logs what it finds. Optionally, it can rate the reputation of your busiest visitors and email you when something urgent happens.
+Vörwatch watches a Linux server for the signs that usually show up early in a compromise, new listening ports, changed critical files, first-seen outbound connections, suspicious process trees, SSH attempts from known-bad IPs, nginx traffic patterns that look like scanning or a volumetric attack, vulnerable installed packages, rootkit/backdoor signatures, CIS-style hardening drift, first-seen outbound DNS queries and logs what it finds. Optionally, it can rate the reputation of your busiest visitors and email you when something urgent happens.
 
 It does **not** ban, block, or auto-remediate anything. Every alert is a recommendation for you to review. That's a deliberate design choice, not a missing feature — see (#philosophy).
 
