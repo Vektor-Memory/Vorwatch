@@ -1,7 +1,7 @@
 #!/bin/bash
 set -uo pipefail
 
-VERSION="0.7.0"
+VERSION="0.8.0"
 
 CONFIG_FILE="${VORWATCH_CONFIG:-/etc/vorwatch/vorwatch.conf}"
 [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
@@ -13,6 +13,19 @@ SEEN_DOMAINS="$DIR/seen-domains.txt"
 BLOCKLIST="$DIR/blocklist-cache.txt"
 BLOCKLIST_URL="${VORWATCH_BLOCKLIST_URL:-https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset}"
 BLOCKLIST_AGE_MAX="${VORWATCH_BLOCKLIST_AGE_MAX:-86400}"
+
+# --- Trusted outbound CIDR allowlist (optional) ---
+# Sites fronted by a CDN/proxy (Cloudflare, etc.) or that routinely call
+# their own infrastructure (mail relay, API partners) generate constant
+# "first-seen outbound IP" noise for connections that aren't actually
+# suspicious -- CDN edge nodes rotate through huge, legitimate ranges.
+# This lets you mark known-good CIDRs so first-seen alerts only fire for
+# IPs genuinely outside your expected footprint. Trusted IPs are still
+# recorded (so you can audit them later) but never alert.
+TRUSTED_CIDRS="$DIR/trusted-cidrs.txt"
+TRUSTED_CIDRS_URL="${VORWATCH_TRUSTED_CIDRS_URL:-}"
+TRUSTED_CIDRS_EXTRA="${VORWATCH_TRUSTED_CIDRS:-}"
+TRUSTED_CIDRS_AGE_MAX="${VORWATCH_TRUSTED_CIDRS_AGE_MAX:-604800}"
 LOG="$DIR/alerts.log"
 CRONLOG="$DIR/cron.log"
 CRON_SCHEDULE="${VORWATCH_CRON_SCHEDULE:-*/15 * * * *}"
@@ -32,6 +45,20 @@ VULN_SCAN="${VORWATCH_VULN_SCAN:-true}"
 VULN_CACHE="$DIR/vuln-cache.txt"
 VULN_CACHE_TTL_HOURS="${VORWATCH_VULN_CACHE_TTL_HOURS:-24}"
 VULN_LAST_FRESH="false"
+
+# --- CISA KEV cross-reference (optional, on by default) ---
+# OSV.dev intentionally returns every historical CVE/USN ever filed
+# against a package version -- including decades-old, low-severity, or
+# already-patched-elsewhere entries. That's comprehensive but not
+# actionable: a fully-patched box can still show 1000+ IDs. This cross-
+# references the CVE IDs OSV finds against CISA's Known Exploited
+# Vulnerabilities catalog -- a small, free, actively-maintained list of
+# CVEs with confirmed real-world exploitation. The intersection is what
+# actually deserves attention; everything else is background noise.
+KEV_SCAN="${VORWATCH_KEV_SCAN:-true}"
+KEV_CACHE="$DIR/kev-cache.txt"
+KEV_URL="${VORWATCH_KEV_URL:-https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json}"
+KEV_CACHE_TTL_HOURS="${VORWATCH_KEV_CACHE_TTL_HOURS:-24}"
 
 # --- Rootkit / backdoor signature scanning (optional) ---
 # Shells out to chkrootkit or rkhunter if either is installed, skipped
@@ -143,7 +170,8 @@ check_urgent_and_notify() {
     "integrity|Critical file hash" \
     "nginx_volume|High request volume" \
     "nginx_scan|Path-scanning pattern" \
-    "rootkit|Rootkit scan"
+    "rootkit|Rootkit scan" \
+    "kev|Known Exploited Vulnerabilities"
   do
     cat="${pair%%|*}"
     pattern="${pair#*|}"
@@ -207,6 +235,62 @@ ip_in_blocklist() {
   ' "$BLOCKLIST"
 }
 
+# Merges an optional fetched URL (e.g. Cloudflare's published IP ranges)
+# with an optional inline comma-separated list into one CIDR file. The
+# fetched portion is cached independently of the merge so a slow/failed
+# fetch doesn't wipe out a previously-good list.
+refresh_trusted_cidrs() {
+  if [ -n "$TRUSTED_CIDRS_URL" ]; then
+    if [ ! -f "$TRUSTED_CIDRS.fetched" ] || [ $(( $(date +%s) - $(stat -c %Y "$TRUSTED_CIDRS.fetched" 2>/dev/null || echo 0) )) -gt "$TRUSTED_CIDRS_AGE_MAX" ]; then
+      curl -s --max-time 15 "$TRUSTED_CIDRS_URL" -o "$TRUSTED_CIDRS.tmp" 2>/dev/null
+      if [ -s "$TRUSTED_CIDRS.tmp" ]; then
+        grep -v '^#' "$TRUSTED_CIDRS.tmp" > "$TRUSTED_CIDRS.fetched"
+        rm -f "$TRUSTED_CIDRS.tmp"
+      fi
+    fi
+  fi
+  {
+    [ -f "$TRUSTED_CIDRS.fetched" ] && cat "$TRUSTED_CIDRS.fetched"
+    [ -n "$TRUSTED_CIDRS_EXTRA" ] && echo "$TRUSTED_CIDRS_EXTRA" | tr ',' '\n' | sed 's/^ *//;s/ *$//'
+    true
+  } | grep -v '^$' > "$TRUSTED_CIDRS.new" 2>/dev/null
+  mv "$TRUSTED_CIDRS.new" "$TRUSTED_CIDRS" 2>/dev/null
+}
+
+# Same CIDR-match logic as ip_in_blocklist, against the trusted list
+# instead. Used to silence first-seen-outbound alerts for known-good
+# infrastructure (your CDN, your mail relay) without disabling the
+# first-seen check entirely.
+ip_in_trusted() {
+  local ip="$1"
+  [ -s "$TRUSTED_CIDRS" ] || return 1
+  awk -v target="$ip" '
+    function ip2int(ip,   a,n) {
+      n = split(ip, a, ".")
+      if (n != 4) return -1
+      return (a[1]*16777216)+(a[2]*65536)+(a[3]*256)+a[4]
+    }
+    BEGIN { t = ip2int(target); found = 0 }
+    {
+      line = $0
+      sub(/#.*/, "", line)
+      gsub(/^[ \t]+|[ \t]+$/, "", line)
+      if (line == "") next
+      if (index(line, "/") > 0) {
+        split(line, parts, "/")
+        net = parts[1]; bits = parts[2] + 0
+      } else {
+        net = line; bits = 32
+      }
+      n = ip2int(net)
+      if (n < 0) next
+      size = 2 ^ (32 - bits)
+      if (t >= n && t < n + size) { found = 1; exit }
+    }
+    END { exit (found ? 0 : 1) }
+  ' "$TRUSTED_CIDRS"
+}
+
 hash_critical_files() {
   for f in $CRITICAL_FILES; do
     if [ -r "$f" ]; then
@@ -258,6 +342,10 @@ check_outbound_first_seen() {
     [ -z "$ip" ] && continue
     case "$ip" in 127.*|100.6[4-9].*|100.[7-9][0-9].*|100.1[0-1][0-9].*|10.*|169.254.*) continue ;; esac
     if ! grep -qF "$ip " "$SEEN_IPS" 2>/dev/null; then
+      if ip_in_trusted "$ip"; then
+        echo "$ip  first_seen=$DATE trusted=1" >> "$SEEN_IPS"
+        continue
+      fi
       echo "$ip  first_seen=$DATE" >> "$SEEN_IPS"
       if ip_in_blocklist "$ip"; then
         alert "Outbound connection to NEW IP $ip - this IP is on the public threat blocklist"
@@ -404,6 +492,16 @@ NGINX_REQ_THRESHOLD="${VORWATCH_NGINX_REQ_THRESHOLD:-200}"
 NGINX_404_THRESHOLD="${VORWATCH_NGINX_404_THRESHOLD:-20}"
 NGINX_WINDOW_LINES="${VORWATCH_NGINX_WINDOW_LINES:-3000}"
 
+# --- Known-bot annotation for nginx top source IPs (optional) ---
+# AbuseIPDB risk scores reflect the reputation of the IP's /24 or ASN,
+# not the specific request pattern -- large cloud ranges (AWS, Azure,
+# GCP) that host legitimate crawlers alongside bad actors often score
+# misleadingly high. This annotates the report's top-5 source IPs with
+# a recognized bot name (from their dominant user-agent) when one
+# matches, so a risk-4 GPTBot doesn't read the same as a risk-4 unknown
+# scanner without more digging.
+KNOWN_BOT_UA_REGEX="${VORWATCH_KNOWN_BOT_UA_REGEX:-Googlebot|bingbot|Slurp|DuckDuckBot|Baiduspider|YandexBot|GPTBot|ChatGPT-User|OAI-SearchBot|ClaudeBot|anthropic-ai|PerplexityBot|CCBot|facebookexternalhit|Twitterbot|LinkedInBot|AhrefsBot|SemrushBot|MJ12bot|PetalBot|Applebot|UptimeRobot}"
+
 check_nginx_anomalies() {
   [ -r "$NGINX_ACCESS_LOG_FOR_CHECK" ] || return
   local recent
@@ -439,19 +537,35 @@ json_escape() {
 # cache file, this just signals that a fresh scan found something.
 check_vulnerabilities() {
   [ "$VULN_SCAN" = "true" ] || return
+  # scan_vulnerabilities() is invoked via command substitution below, which
+  # runs it in a subshell -- VULN_LAST_FRESH="true" set inside never reaches
+  # this scope, so freshness is instead detected by watching whether the
+  # cache file's mtime actually changed across the call.
+  local cache_before cache_after
+  cache_before=$(stat -c %Y "$VULN_CACHE" 2>/dev/null || echo 0)
   local findings
   findings=$(scan_vulnerabilities)
-  [ "$VULN_LAST_FRESH" = "true" ] || return
+  cache_after=$(stat -c %Y "$VULN_CACHE" 2>/dev/null || echo 0)
+  [ "$cache_after" != "$cache_before" ] || return
   [ -n "$findings" ] || return
   local pkg_count cve_total
   pkg_count=$(echo "$findings" | grep -c .)
   cve_total=$(echo "$findings" | awk -F': ' '{n=split($2,a,","); t+=n} END{print t+0}')
   alert "$pkg_count installed package(s) have known vulnerabilities ($cve_total total CVE/USN ID(s)) - see 'vorwatch report' for the list, or https://osv.dev"
+
+  fetch_kev
+  local kev_hits kev_count
+  kev_hits=$(kev_matches "$findings")
+  if [ -n "$kev_hits" ]; then
+    kev_count=$(echo "$kev_hits" | grep -c .)
+    alert "$kev_count installed package CVE(s) are on CISA's Known Exploited Vulnerabilities catalog (confirmed real-world exploitation): $(echo "$kev_hits" | tr '\n' ' ') - patch these first, see 'vorwatch report'"
+  fi
 }
 
 cmd_check() {
   RUN_ALERTS=""
   refresh_blocklist
+  refresh_trusted_cidrs
   check_listening_ports
   check_file_integrity
   check_outbound_first_seen
@@ -622,6 +736,58 @@ for (name, version), result in zip(pkgs, results):
   echo "$findings"
 }
 
+# Downloads and caches CISA's Known Exploited Vulnerabilities catalog as
+# a flat list of CVE IDs. Small (a few thousand entries), free, no API
+# key, updated by CISA as new exploitation is confirmed. Cached for
+# KEV_CACHE_TTL_HOURS like the vuln scan itself.
+fetch_kev() {
+  [ "$KEV_SCAN" = "true" ] || return
+  local now cache_ts age_h
+  now=$(date +%s)
+  if [ -f "$KEV_CACHE" ]; then
+    cache_ts=$(head -1 "$KEV_CACHE" 2>/dev/null | awk '{print $4}')
+    if [ -n "$cache_ts" ]; then
+      age_h=$(( (now - cache_ts) / 3600 ))
+      [ "$age_h" -lt "$KEV_CACHE_TTL_HOURS" ] && return
+    fi
+  fi
+  command -v python3 >/dev/null 2>&1 || return
+  local resp
+  resp=$(curl -s --max-time 20 "$KEV_URL" 2>/dev/null)
+  [ -n "$resp" ] || return
+  local ids
+  ids=$(echo "$resp" | python3 -c '
+import sys, json
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for v in data.get("vulnerabilities", []):
+    cve = v.get("cveID")
+    if cve:
+        print(cve)
+' 2>/dev/null)
+  [ -n "$ids" ] || return
+  {
+    echo "# cached at $now"
+    echo "$ids"
+  } > "$KEV_CACHE"
+}
+
+# Extracts CVE IDs embedded in OSV findings (e.g. "UBUNTU-CVE-2024-6387"
+# contains "CVE-2024-6387") and intersects them against the cached KEV
+# list. Plain USN-only IDs with no embedded CVE can't be matched this
+# way and are silently skipped -- that's a known limitation, not a bug.
+kev_matches() {
+  local findings="$1"
+  [ "$KEV_SCAN" = "true" ] || return
+  [ -s "$KEV_CACHE" ] || return
+  echo "$findings" | grep -oE 'CVE-[0-9]{4}-[0-9]+' | sort -u | \
+  while read -r cve; do
+    grep -qxF "$cve" "$KEV_CACHE" 2>/dev/null && echo "$cve"
+  done
+}
+
 report_fail2ban_text() {
   command -v fail2ban-client >/dev/null 2>&1 || return
   local jails
@@ -667,9 +833,20 @@ report_nginx_text() {
   awk '{print $1}' "$NGINX_ACCESS_LOG" 2>/dev/null | sort | uniq -c | sort -rn | head -5 | \
   while read -r count ip; do
     [ -z "$ip" ] && continue
-    local risk
+    local risk bot_tag ua
     risk=$(ip_reputation_score "$ip")
-    printf "    %-20s %-12s [risk %s]\n" "$ip" "$count requests" "$risk"
+    bot_tag=""
+    # Split on double-quote instead of anchoring to end-of-line: some nginx
+    # configs (this one included) append extra unquoted fields after the
+    # user-agent (e.g. "cf_ip=..."), which breaks a $-anchored quote match.
+    # In the standard combined log format the user-agent is always the 3rd
+    # quoted segment (request, referer, user-agent), i.e. awk field 6 when
+    # splitting on '"'.
+    ua=$(grep -F "$ip " "$NGINX_ACCESS_LOG" 2>/dev/null | awk -F'"' 'NF>=6{print $6}' | sort | uniq -c | sort -rn | head -1 | sed -E 's/^ *[0-9]+ //')
+    if [ -n "$ua" ] && echo "$ua" | grep -qiE "$KNOWN_BOT_UA_REGEX"; then
+      bot_tag=" [bot: $(echo "$ua" | grep -ioE "$KNOWN_BOT_UA_REGEX" | head -1)]"
+    fi
+    printf "    %-20s %-12s [risk %s]%s\n" "$ip" "$count requests" "$risk" "$bot_tag"
   done
   echo "  Top 5 paths returning 404 (scan/probe signal):"
   awk '$9==404 {print $7}' "$NGINX_ACCESS_LOG" 2>/dev/null | sort | uniq -c | sort -rn | head -5 | \
@@ -706,6 +883,20 @@ report_vulnerabilities_text() {
       echo "  ... and $(( pkg_count - shown )) more package(s) not shown (see $VULN_CACHE for the full list)"
     fi
     echo "  Look up any ID at: https://osv.dev/vulnerability/<ID>"
+
+    fetch_kev
+    local kev_hits kev_count
+    kev_hits=$(kev_matches "$findings")
+    echo
+    echo "${C_CYAN}-- Actively Exploited (CISA KEV cross-reference) --${C_RESET}"
+    if [ -n "$kev_hits" ]; then
+      kev_count=$(echo "$kev_hits" | grep -c .)
+      echo "  ${C_RED}$kev_count CVE ID(s) above are on CISA's Known Exploited Vulnerabilities catalog -- confirmed real-world exploitation, prioritize these first:${C_RESET}"
+      echo "$kev_hits" | sed 's/^/    /'
+      echo "  Details: https://www.cisa.gov/known-exploited-vulnerabilities-catalog"
+    else
+      echo "  none of the $cve_total CVE ID(s) above are on CISA's KEV list -- nothing here has confirmed real-world exploitation"
+    fi
   else
     echo "  none found (or python3/os-release unavailable, or scan not yet run)"
   fi
@@ -773,6 +964,8 @@ cmd_report() {
     blocked_out=$(echo "$filtered" | grep -c "threat blocklist" || true)
     sus_proc=$(echo "$filtered" | grep -c "Suspicious process" || true)
     blocked_ssh=$(echo "$filtered" | grep -c "KNOWN-BAD IP" || true)
+    local kev_json
+    kev_json=$(echo "$filtered" | grep -c "Known Exploited Vulnerabilities catalog" || true)
 
     printf '{\n'
     printf '  "generated": "%s",\n' "$(echo -n "$DATE" | json_escape)"
@@ -789,7 +982,8 @@ cmd_report() {
     printf '    "first_seen_outbound_ip": %d,\n' "$first_seen"
     printf '    "blocklisted_outbound": %d,\n' "$blocked_out"
     printf '    "suspicious_proc_tree": %d,\n' "$sus_proc"
-    printf '    "blocklisted_ssh_source": %d\n' "$blocked_ssh"
+    printf '    "blocklisted_ssh_source": %d,\n' "$blocked_ssh"
+    printf '    "kev_hits": %d\n' "$kev_json"
     printf '  },\n'
     printf '  "recent_alerts": [\n'
     local first=1
@@ -813,8 +1007,8 @@ cmd_report() {
     echo
 
     local hits
-    hits=$(echo "$filtered" | grep -E "threat blocklist|KNOWN-BAD IP|Critical file hash|Rootkit scan")
-    echo "${C_CYAN}-- High Priority (blocklist matches + integrity/rootkit hits) --${C_RESET}"
+    hits=$(echo "$filtered" | grep -E "threat blocklist|KNOWN-BAD IP|Critical file hash|Rootkit scan|Known Exploited Vulnerabilities catalog")
+    echo "${C_CYAN}-- High Priority (blocklist matches + integrity/rootkit/KEV hits) --${C_RESET}"
     if [ -n "$hits" ]; then
       echo "$hits" | sed "s/^/  ${C_RED}/;s/\$/${C_RESET}/"
     else
@@ -834,6 +1028,7 @@ cmd_report() {
     echo "  Rootkit findings:       $(echo "$filtered" | grep -c "Rootkit scan" || true)"
     echo "  First-seen DNS queries: $(echo "$filtered" | grep -c "first-seen outbound DNS" || true)"
     echo "  Vulnerable packages:    $(echo "$filtered" | grep -c "known vulnerabilities" || true)"
+    echo "  KEV (actively exploited): $(echo "$filtered" | grep -c "Known Exploited Vulnerabilities catalog" || true)"
     echo
 
     report_vitals_text
@@ -925,6 +1120,16 @@ cmd_status() {
       info "  Rootkit scanning enabled but neither chkrootkit nor rkhunter is installed — skipped"
     fi
   fi
+  if [ "$KEV_SCAN" = "true" ]; then
+    if [ -s "$KEV_CACHE" ]; then
+      ok "CISA KEV cross-reference enabled ($(grep -c . "$KEV_CACHE" 2>/dev/null || echo 0) entries cached)"
+    else
+      info "  CISA KEV cross-reference enabled but not yet fetched — runs on next 'vorwatch check' or 'report'"
+    fi
+  fi
+  if [ -n "$TRUSTED_CIDRS_URL" ] || [ -n "$TRUSTED_CIDRS_EXTRA" ]; then
+    ok "Trusted outbound CIDR allowlist configured ($(grep -c . "$TRUSTED_CIDRS" 2>/dev/null || echo 0) ranges)"
+  fi
   local alert_count
   alert_count=$(wc -l < "$LOG" 2>/dev/null || echo 0)
   info "  $alert_count total alerts logged, $(wc -l < "$SEEN_IPS" 2>/dev/null || echo 0) known outbound IPs (TTL ${SEEN_IP_TTL_DAYS}d)"
@@ -1007,12 +1212,41 @@ Additional detection layers (all optional, all on by default except DNS):
                                      enable first-seen DNS query tracking
   VORWATCH_DNS_WINDOW_LINES         default 2000
 
+Noise reduction / signal quality (all optional):
+  VORWATCH_KEV_SCAN                 true|false (default true) - cross-
+                                     references OSV-found CVE IDs against
+                                     CISA's Known Exploited Vulnerabilities
+                                     catalog, so you can tell "actually
+                                     exploited in the wild" apart from
+                                     "OSV found something historical"
+  VORWATCH_KEV_CACHE_TTL_HOURS      default 24 - how often to re-fetch
+                                     the KEV catalog
+  VORWATCH_TRUSTED_CIDRS            comma-separated CIDRs/IPs that should
+                                     never trigger a first-seen-outbound-IP
+                                     alert (e.g. your CDN's edge ranges,
+                                     mail relay, or other known-good infra)
+  VORWATCH_TRUSTED_CIDRS_URL        optional URL to fetch a trusted CIDR
+                                     list from (e.g. Cloudflare's published
+                                     ranges: https://www.cloudflare.com/ips-v4),
+                                     merged with VORWATCH_TRUSTED_CIDRS and
+                                     refreshed every VORWATCH_TRUSTED_CIDRS_AGE_MAX
+                                     seconds (default 7 days)
+  VORWATCH_TRUSTED_CIDRS_AGE_MAX    default 604800 (7 days)
+  VORWATCH_KNOWN_BOT_UA_REGEX       override the built-in list of known
+                                     good crawler user-agents (Googlebot,
+                                     GPTBot, ClaudeBot, etc.) annotated
+                                     next to nginx top-5 source IPs, so a
+                                     risk score on shared cloud IP space
+                                     doesn't read the same as an unknown
+                                     scanner without checking the log
+                                     yourself
+
 Urgent alerts (blocklisted outbound/SSH, critical file changes, nginx
-scan/volume anomalies, rootkit hits) email immediately regardless of
-schedule, subject to the per-category cooldown above. Everything else
-(new ports, suspicious process trees, CIS findings, vulnerable packages,
-first-seen DNS queries, routine first-seen IPs) appears in the scheduled
-digest only.
+scan/volume anomalies, rootkit hits, CISA KEV matches) email immediately
+regardless of schedule, subject to the per-category cooldown above.
+Everything else (new ports, suspicious process trees, CIS findings,
+vulnerable packages, first-seen DNS queries, routine first-seen IPs)
+appears in the scheduled digest only.
 HELP_EOF
 }
 

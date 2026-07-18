@@ -1,17 +1,31 @@
 # Vörwatch
 
-**Vör's Watch** A lightweight, dependency-free VPS anomaly detection in a single bash script.
+**Vör's Watch** — lightweight, dependency-free VPS anomaly detection in a single bash script.
 
 Named for Vör, the Old Norse goddess of vigilant awareness, described in the Prose Edda as "wise and inquiring, so that nothing can be concealed from her."
 
-Vörwatch watches a Linux server for the signs that usually show up early in a compromise, new listening ports, changed critical files, first-seen outbound connections, suspicious process trees, SSH attempts from known-bad IPs, nginx traffic patterns that look like scanning or a volumetric attack, vulnerable installed packages, rootkit/backdoor signatures, CIS-style hardening drift, first-seen outbound DNS queries and logs what it finds. Optionally, it can rate the reputation of your busiest visitors and email you when something urgent happens.
+Vörwatch watches a Linux server for the signs that usually show up early in a compromise — new listening ports, changed critical files, first-seen outbound connections, suspicious process trees, SSH attempts from known-bad IPs, nginx traffic patterns that look like scanning or a volumetric attack, vulnerable installed packages, rootkit/backdoor signatures, CIS-style hardening drift, and first-seen outbound DNS queries — and logs what it finds. Vulnerability findings get cross-referenced against CISA's Known Exploited Vulnerabilities catalog so you can tell historical OSV noise apart from confirmed real-world exploitation, and known-good infrastructure (your CDN's edge ranges, etc.) can be allowlisted so it stops generating first-seen-IP noise. Optionally, it can rate the reputation of your busiest visitors, annotate known crawlers, and email you when something urgent happens.
 
 It does **not** ban, block, or auto-remediate anything. Every alert is a recommendation for you to review. That's a deliberate design choice, not a missing feature — see (#philosophy).
 
-<img width="1074" height="530" alt="Screenshot 2026-07-17 183435" src="https://github.com/user-attachments/assets/7cef88c5-a40b-44e5-a814-895bca7bcffc" />
-
+<img width="994" height="579" alt="image" src="https://github.com/user-attachments/assets/7da10027-f54a-46cf-a11f-f64106ee1d58" />
 
 ---
+
+## Overview
+
+Vörwatch is a single bash script you drop on a Linux VPS and run off cron. Every 15 minutes (configurable) it checks the box against its own known-good baseline and a handful of external signals, logs anything that looks off, and gets out of the way — no daemon, no database, no dashboard to babysit.
+
+It covers four broad areas:
+
+- **Host state** — file integrity (SHA-256 baseline of critical config files), listening ports, suspicious process parent/child pairings, CIS-style sshd/permission hardening drift
+- **Network** — first-seen outbound connections cross-referenced against a public threat blocklist, SSH attempts from known-bad IPs, optional first-seen DNS query tracking
+- **Software supply chain** — installed package versions checked against OSV.dev's vulnerability database, cross-referenced against CISA's Known Exploited Vulnerabilities catalog to separate "historical noise" from "confirmed exploited in the wild," optional rootkit/backdoor signature scanning via chkrootkit or rkhunter
+- **Web traffic** — nginx request-volume and 404-scanning anomaly detection, fail2ban stats, optional AbuseIPDB reputation scoring on your busiest visitors, known-crawler annotation (Googlebot, GPTBot, ClaudeBot, etc.) so a risk score on shared cloud IP space doesn't read the same as an unknown scanner
+
+Everything it finds lands in a flat alert log, viewable as a text or JSON report, with optional email delivery (urgent findings immediately, everything else in a scheduled digest). It never takes action on your behalf — see [Philosophy](#philosophy).
+
+Sites behind a CDN or proxy can also configure a **trusted outbound CIDR allowlist** so first-seen-IP alerts stop firing on the CDN's own rotating edge ranges — see [Noise reduction](#noise-reduction).
 
 ## Features
 
@@ -23,17 +37,20 @@ It does **not** ban, block, or auto-remediate anything. Every alert is a recomme
 - **nginx anomaly detection** — high-request-volume and 404-scanning detection per source IP, configurable thresholds
 - **fail2ban + nginx stats** — bundled into one report
 - **Package vulnerability scanning** — checks your installed package list against [OSV.dev](https://osv.dev)'s free vulnerability database in one batched call, no API key needed. Report output is capped (top packages by CVE count, top CVE IDs per package) so an older box with hundreds of historical findings doesn't blow out the report — full detail always lives in the cache file
+- **CISA KEV cross-reference** — cross-checks OSV-found CVE IDs against CISA's [Known Exploited Vulnerabilities catalog](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) (free, no key, actively maintained) so you can tell "OSV found something historical" apart from "this is confirmed being exploited right now" — a KEV match is treated as high-priority and emails immediately if configured
 - **Rootkit / backdoor scanning** — shells out to `chkrootkit` or `rkhunter` if either is installed, rate-limited independently of the check cadence
 - **CIS-style hardening spot-checks** — sshd config (root login, password auth) and critical file permissions (`/etc/shadow`, `/etc/passwd`), only re-alerts when findings actually change
 - **DNS query anomaly detection** *(optional, off by default)* — first-seen queried domain tracking, same pattern as outbound IPs, if you point it at a resolver log
+- **Trusted outbound CIDR allowlist** *(optional)* — mark known-good infrastructure (your CDN's edge ranges, mail relay, etc.) so first-seen-outbound-IP alerts stop firing on traffic that isn't actually suspicious; can auto-fetch from a URL (e.g. Cloudflare's published ranges) or be set inline
+- **Known-bot annotation** *(optional)* — tags nginx top-5 source IPs with a recognized crawler name (Googlebot, GPTBot, ClaudeBot, etc.) when the user-agent matches, since large cloud IP ranges that host legitimate crawlers alongside bad actors can score misleadingly high on reputation alone
 - **Optional: IP reputation scoring** — grades your top-5 nginx source IPs 1–5 for risk via [AbuseIPDB](https://www.abuseipdb.com) (bring your own free-tier key)
-- **Optional: email notifications** — urgent alerts (blocklist hits, file tampering, attack patterns, rootkit hits) send immediately; everything else lands in a scheduled digest, via [Resend](https://resend.com) (bring your own free-tier key)
+- **Optional: email notifications** — urgent alerts (blocklist hits, file tampering, attack patterns, rootkit hits, KEV matches) send immediately; everything else lands in a scheduled digest, via [Resend](https://resend.com) (bring your own free-tier key)
 - **Zero daemon, zero database** — one bash file, runs off cron, state lives in flat files
 - **Text and JSON report output** — pipe the JSON output into whatever you already use for monitoring
 
 ## Philosophy
 
-Vörwatch is recommend-only by design. It will never run `ufw deny`, never call `fail2ban-client banip`, never touch iptables. Every alert that suggests an action tells you the exact command to run yourself. This is intentional: automated banning based on heuristics has a real false-positive cost on a single production box, and the unknown risk of unattended firewall changes isn't worth the convenience for most single-server setups. If you want auto-remediation, this isn't that tool — pair it with a gui based security suite. 
+Vörwatch is recommend-only by design. It will never run `ufw deny`, never call `fail2ban-client banip`, never touch iptables. Every alert that suggests an action tells you the exact command to run yourself. This is intentional: automated banning based on heuristics has a real false-positive cost on a single production box, and the unknown risk of unattended firewall changes isn't worth the convenience for most single-server setups. If you want auto-remediation, this isn't that tool — pair it with something like [CrowdSec](https://crowdsec.net) instead.
 
 ## Requirements
 
@@ -119,6 +136,12 @@ All settings live in `/etc/vorwatch/vorwatch.conf` — plain shell variable assi
 | `VORWATCH_CIS_CHECKS` | `true` | sshd hardening + critical file permission spot-checks |
 | `VORWATCH_DNS_LOG` | unset | Path to a resolver log (dnsmasq/systemd-resolved) — enables first-seen DNS query tracking |
 | `VORWATCH_DNS_WINDOW_LINES` | `2000` | How many recent DNS log lines each `check` scans |
+| `VORWATCH_KEV_SCAN` | `true` | Cross-references OSV-found CVE IDs against CISA's Known Exploited Vulnerabilities catalog |
+| `VORWATCH_KEV_CACHE_TTL_HOURS` | `24` | How often to re-fetch the KEV catalog |
+| `VORWATCH_TRUSTED_CIDRS` | unset | Comma-separated CIDRs/IPs that should never trigger a first-seen-outbound-IP alert |
+| `VORWATCH_TRUSTED_CIDRS_URL` | unset | Optional URL to fetch a trusted CIDR list from (e.g. Cloudflare's published ranges), merged with `VORWATCH_TRUSTED_CIDRS` |
+| `VORWATCH_TRUSTED_CIDRS_AGE_MAX` | `604800` | Seconds before the fetched trusted CIDR list re-downloads (default 7 days) |
+| `VORWATCH_KNOWN_BOT_UA_REGEX` | see script | Override the built-in list of known-good crawler user-agents annotated next to nginx top-5 source IPs |
 
 ## IP reputation scoring
 
@@ -127,13 +150,13 @@ Scoped deliberately narrow: only your nginx **top-5 source IPs by request count*
 ```
 Top 5 source IPs by request count (risk 1-5, 5=critical, via AbuseIPDB):
     115.186.231.43         35 requests  [risk 1]
+    74.7.243.194           38 requests  [risk 4] [bot: GPTBot]
     3.99.128.211           17 requests  [risk 2]
     216.73.217.6           8 requests  [risk 5]
     34.56.201.30           5 requests  [risk 1]
-    40.223.148.196         4 requests  [risk 1]
 ```
 
-Note the risk score isn't just a function of volume — a low-traffic IP can still come back as high-risk if AbuseIPDB has real abuse reports against it, which raw request counts alone would never catch.
+Note the risk score isn't just a function of volume — a low-traffic IP can still come back as high-risk if AbuseIPDB has real abuse reports against it, which raw request counts alone would never catch. It also isn't request-pattern-aware — large cloud IP ranges (AWS, Azure, GCP) that host legitimate crawlers alongside bad actors often score misleadingly high just for being on that shared infrastructure. That's what the `[bot: ...]` tag above is for: it's a separate, independent signal (the dominant user-agent for that IP, matched against `VORWATCH_KNOWN_BOT_UA_REGEX`) that tells you *why* an IP might be flagged despite being a known-good crawler like GPTBot, Googlebot, or ClaudeBot — a risk-4 GPTBot and a risk-4 unknown scanner are not the same thing, even though AbuseIPDB alone can't tell you that.
 
 Get a free key at [abuseipdb.com](https://www.abuseipdb.com) (1000 checks/day, no credit card). Without a key configured, top-5 IPs just show as `unrated` — everything else in the report works normally.
 
@@ -142,6 +165,30 @@ Get a free key at [abuseipdb.com](https://www.abuseipdb.com) (1000 checks/day, n
 Scans your installed package list against [OSV.dev](https://osv.dev)'s free vulnerability database in a single batched HTTP call — not one call per package. Needs `python3` (used for correct JSON parsing, not bash regex against nested data); skipped entirely if it's not present. Results are cached for `VORWATCH_VULN_CACHE_TTL_HOURS` (default 24h), so repeat runs don't re-hit the API.
 
 OSV.dev returns every historical CVE/USN ever filed against a package version, including old, low-severity, or already-patched-elsewhere entries — on an older or heavily-packaged box that can mean dozens of packages with hundreds of IDs each. The report caps this at both levels: `VORWATCH_VULN_REPORT_MAX` (default 15) packages shown, sorted by CVE count, with a "N more not shown" footer; and `VORWATCH_VULN_IDS_PER_PKG` (default 8) CVE IDs per package line, with a "(+N more)" suffix. The full, uncapped list always lives in the cache file (`vuln-cache.txt` in your `VORWATCH_DIR`). Alerts are a single summary line per scan ("N packages have known vulnerabilities"), not one alert per package.
+
+Distro-patched versions (e.g. Ubuntu's `+esm3`, `~esm1` suffixes) still get cited by OSV against their base CVE — that's a known OSV limitation, not a sign the package is actually unpatched. A version string carrying a distro security suffix means the fix is already applied even though OSV still lists the CVE.
+
+## CISA KEV cross-reference
+
+A raw OSV finding count is comprehensive but not actionable — a fully-patched box can still show 1000+ historical CVE IDs, most fixed years ago or irrelevant to the installed version. This cross-references every CVE ID OSV finds against [CISA's Known Exploited Vulnerabilities catalog](https://www.cisa.gov/known-exploited-vulnerabilities-catalog): a small (a few thousand entries), free, no-key, actively-maintained list of CVEs with *confirmed* real-world exploitation. The intersection — not the raw OSV count — is what actually deserves your attention.
+
+```
+-- Actively Exploited (CISA KEV cross-reference) --
+  1 CVE ID(s) above are on CISA's Known Exploited Vulnerabilities catalog -- confirmed real-world exploitation, prioritize these first:
+    CVE-2024-6387
+  Details: https://www.cisa.gov/known-exploited-vulnerabilities-catalog
+```
+
+If nothing matches, the report says so explicitly rather than leaving you to infer it from an absent section:
+
+```
+-- Actively Exploited (CISA KEV cross-reference) --
+  none of the 1395 CVE ID(s) above are on CISA's KEV list -- nothing here has confirmed real-world exploitation
+```
+
+A KEV match is treated as high-priority: it appears in the report's "High Priority" section, counts toward the `KEV (actively exploited)` alert-summary line, and — if email is configured — sends immediately, subject to the same per-category cooldown as other urgent alerts.
+
+Only CVE IDs embedded in an OSV finding (e.g. `UBUNTU-CVE-2024-6387` contains `CVE-2024-6387`) can be matched this way; plain USN-only IDs with no embedded CVE are silently skipped. This is a known limitation, not a bug — CISA's catalog is keyed by CVE ID, and USN identifiers aren't a 1:1 mapping.
 
 ## Rootkit / backdoor scanning
 
@@ -155,14 +202,29 @@ Not a full CIS benchmark suite — a handful of cheap, high-value checks: `Permi
 
 Off by default — not every box runs a local resolver that logs queries. Point `VORWATCH_DNS_LOG` at a resolver log (dnsmasq or systemd-resolved) to enable first-seen domain tracking, the same pattern used for first-seen outbound IPs.
 
+## Noise reduction
+
+Two related features that don't add new checks so much as make the existing ones more signal, less noise.
+
+**Trusted outbound CIDR allowlist.** Sites fronted by a CDN or proxy generate constant "first-seen outbound IP" alerts for connections to the CDN's own rotating edge ranges — that's not suspicious, it's just infrastructure, but Vörwatch has no way to know that by default. Set `VORWATCH_TRUSTED_CIDRS` to a comma-separated list of known-good CIDRs/IPs, or `VORWATCH_TRUSTED_CIDRS_URL` to fetch a list from a URL (Cloudflare's published ranges work well here: `https://www.cloudflare.com/ips-v4`), refreshed every `VORWATCH_TRUSTED_CIDRS_AGE_MAX` seconds (default 7 days). Trusted IPs are still recorded to `seen-outbound-ips.txt` for later audit — they just never generate an alert.
+
+```bash
+# /etc/vorwatch/vorwatch.conf
+VORWATCH_TRUSTED_CIDRS_URL="https://www.cloudflare.com/ips-v4"
+# or, for infra with no published range list:
+VORWATCH_TRUSTED_CIDRS="10.0.0.0/8,203.0.113.5"
+```
+
+**Known-bot annotation.** AbuseIPDB risk scores reflect the reputation of an IP's /24 or ASN, not the specific request pattern — large cloud ranges (AWS, Azure, GCP) that host legitimate crawlers alongside bad actors often score misleadingly high just for being on that shared infrastructure. The report's nginx top-5 source IPs get annotated with a recognized crawler name (from the dominant user-agent) when one matches a built-in list covering Googlebot, Bingbot, GPTBot, ClaudeBot, PerplexityBot, and a dozen others — override the list entirely with `VORWATCH_KNOWN_BOT_UA_REGEX` if you want to add or restrict it. This is purely a display annotation; it doesn't change the risk score or suppress any alert.
+
 ## Email notifications
 
 Bring your own [Resend](https://resend.com) account (free tier available, no credit card for low volume). You'll need a domain verified in Resend for the `From` address to deliver — Resend's dashboard walks you through the DNS records.
 
 Two tracks:
 
-- **Urgent** — blocklisted outbound connections, blocklisted SSH source IPs, critical file changes, nginx volume/scan-pattern anomalies, and rootkit hits email immediately when `vorwatch check` finds them, subject to a per-category cooldown (default 4 hours) so a sustained attack sends one email per category per window, not one every 15 minutes.
-- **Digest** — everything else (new listening ports, suspicious process trees, routine first-seen outbound IPs, CIS findings, vulnerable packages, first-seen DNS queries) lands in a scheduled report, sent weekly (Monday, configurable) or daily, your choice.
+- **Urgent** — blocklisted outbound connections, blocklisted SSH source IPs, critical file changes, nginx volume/scan-pattern anomalies, rootkit hits, and CISA KEV matches email immediately when `vorwatch check` finds them, subject to a per-category cooldown (default 4 hours) so a sustained attack sends one email per category per window, not one every 15 minutes.
+- **Digest** — everything else (new listening ports, suspicious process trees, routine first-seen outbound IPs not on the trusted CIDR list, CIS findings, vulnerable packages, first-seen DNS queries) lands in a scheduled report, sent weekly (Monday, configurable) or daily, your choice.
 
 If email fails — bad key, network hiccup, whatever — it fails silently and never affects `check` or `report`'s own exit code. Monitoring itself never depends on the email path working.
 
@@ -175,7 +237,7 @@ If email fails — bad key, network hiccup, whatever — it fails silently and n
  Range: today
 ============================================================
 
--- High Priority (blocklist matches + integrity/rootkit hits) --
+-- High Priority (blocklist matches + integrity/rootkit/KEV hits) --
   none
 
 -- Alert Summary (today) --
@@ -190,6 +252,7 @@ If email fails — bad key, network hiccup, whatever — it fails silently and n
   Rootkit findings:       0
   First-seen DNS queries: 0
   Vulnerable packages:    0
+  KEV (actively exploited): 0
 
 -- System Vitals --
   Load average: 0.00, 0.00, 0.05
@@ -204,6 +267,7 @@ If email fails — bad key, network hiccup, whatever — it fails silently and n
   Requests logged:        449
   Top 5 source IPs by request count (risk 1-5, 5=critical, via AbuseIPDB):
     115.186.231.43       35 requests  [risk 1]
+    74.7.243.194         38 requests  [risk 4] [bot: GPTBot]
   ...
 
 -- Package Vulnerabilities (OSV.dev, cached) --
@@ -211,6 +275,9 @@ If email fails — bad key, network hiccup, whatever — it fails silently and n
   ...
   and 1 more package(s) not shown (see vuln-cache.txt for the full list)
   Look up any ID at: https://osv.dev/vulnerability/<ID>
+
+-- Actively Exploited (CISA KEV cross-reference) --
+  none of the 1 CVE ID(s) above are on CISA's KEV list -- nothing here has confirmed real-world exploitation
 
 -- Rootkit Scan --
   Last scan: 3h ago (runs at most every 24h)
