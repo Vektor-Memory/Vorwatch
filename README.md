@@ -152,8 +152,8 @@ Top 5 source IPs by request count (risk 1-5, 5=critical, via AbuseIPDB):
     115.186.231.43         35 requests  [risk 1]
     74.7.243.194           38 requests  [risk 4] [bot: GPTBot]
     3.99.128.211           17 requests  [risk 2]
-    216.73.217.6           8 requests  [risk 5]
-    34.56.201.30           5 requests  [risk 1]
+    216.73.217.6           8 requests   [risk 5]
+    34.56.201.30           5 requests   [risk 1]
 ```
 
 Note the risk score isn't just a function of volume — a low-traffic IP can still come back as high-risk if AbuseIPDB has real abuse reports against it, which raw request counts alone would never catch. It also isn't request-pattern-aware — large cloud IP ranges (AWS, Azure, GCP) that host legitimate crawlers alongside bad actors often score misleadingly high just for being on that shared infrastructure. That's what the `[bot: ...]` tag above is for: it's a separate, independent signal (the dominant user-agent for that IP, matched against `VORWATCH_KNOWN_BOT_UA_REGEX`) that tells you *why* an IP might be flagged despite being a known-good crawler like GPTBot, Googlebot, or ClaudeBot — a risk-4 GPTBot and a risk-4 unknown scanner are not the same thing, even though AbuseIPDB alone can't tell you that.
