@@ -1,7 +1,7 @@
 #!/bin/bash
 set -uo pipefail
 
-VERSION="0.8.0"
+VERSION="0.9.0"
 
 CONFIG_FILE="${VORWATCH_CONFIG:-/etc/vorwatch/vorwatch.conf}"
 [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
@@ -544,7 +544,7 @@ check_vulnerabilities() {
   local cache_before cache_after
   cache_before=$(stat -c %Y "$VULN_CACHE" 2>/dev/null || echo 0)
   local findings
-  findings=$(scan_vulnerabilities)
+  findings=$(scan_vulnerabilities | filter_upgradable)
   cache_after=$(stat -c %Y "$VULN_CACHE" 2>/dev/null || echo 0)
   [ "$cache_after" != "$cache_before" ] || return
   [ -n "$findings" ] || return
@@ -645,6 +645,21 @@ ip_reputation_score() {
 # rest of the script leans on coreutils. Cached for VULN_CACHE_TTL_HOURS.
 # Sets VULN_LAST_FRESH=true only when an actual scan ran this call (not
 # a cache hit), so callers can tell the difference.
+filter_upgradable() {
+  local input upgradable
+  input=$(cat)
+  [ -n "$input" ] || return
+  upgradable=$(apt list --upgradable 2>/dev/null | cut -d/ -f1)
+  if [ -z "$upgradable" ]; then
+    echo "$input"
+    return
+  fi
+  echo "$input" | awk -v upg="$upgradable" '
+    BEGIN { n = split(upg, arr, "\n"); for (i = 1; i <= n; i++) up[arr[i]] = 1 }
+    { split($1, f, " "); if (f[1] in up) print }
+  '
+}
+
 scan_vulnerabilities() {
   [ "$VULN_SCAN" = "true" ] || return
   VULN_LAST_FRESH="false"
@@ -858,11 +873,11 @@ report_vulnerabilities_text() {
   [ "$VULN_SCAN" = "true" ] || return
   echo "${C_CYAN}-- Package Vulnerabilities (OSV.dev, cached) --${C_RESET}"
   local findings pkg_count cve_total shown
-  findings=$(scan_vulnerabilities)
+  findings=$(scan_vulnerabilities | filter_upgradable)
   if [ -n "$findings" ]; then
     pkg_count=$(echo "$findings" | grep -c .)
     cve_total=$(echo "$findings" | awk -F': ' '{n=split($2,a,","); t+=n} END{print t+0}')
-    echo "  $pkg_count package(s), $cve_total total CVE/USN ID(s) found (via OSV.dev, includes historical/low-severity entries)"
+    echo "  $pkg_count package(s), $cve_total total CVE/USN ID(s) found (via OSV.dev, filtered to packages with an apt upgrade available)"
     shown="${VORWATCH_VULN_REPORT_MAX:-15}"
     local ids_shown="${VORWATCH_VULN_IDS_PER_PKG:-8}"
     echo "$findings" \

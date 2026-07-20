@@ -1,6 +1,6 @@
 {
   "name": "@vektormemory/vorwatch",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Vör's Watch — lightweight, dependency-free VPS anomaly detection: file integrity, port/process baselining, outbound IP reputation, package vulnerability scanning, CISA KEV cross-reference, trusted-CIDR noise filtering, known-bot annotation, rootkit detection, CIS-style hardening checks, nginx anomaly detection, optional email alerts. Recommend-only, never auto-bans.",
   "bin": {
     "vorwatch": "bin/vorwatch",

@@ -1,4 +1,4 @@
-# Vörwatch v0.8.0
+# Vörwatch
 
 **Vör's Watch** — lightweight, dependency-free VPS anomaly detection in a single bash script.
 
@@ -167,6 +167,8 @@ Scans your installed package list against [OSV.dev](https://osv.dev)'s free vuln
 OSV.dev returns every historical CVE/USN ever filed against a package version, including old, low-severity, or already-patched-elsewhere entries — on an older or heavily-packaged box that can mean dozens of packages with hundreds of IDs each. The report caps this at both levels: `VORWATCH_VULN_REPORT_MAX` (default 15) packages shown, sorted by CVE count, with a "N more not shown" footer; and `VORWATCH_VULN_IDS_PER_PKG` (default 8) CVE IDs per package line, with a "(+N more)" suffix. The full, uncapped list always lives in the cache file (`vuln-cache.txt` in your `VORWATCH_DIR`). Alerts are a single summary line per scan ("N packages have known vulnerabilities"), not one alert per package.
 
 Distro-patched versions (e.g. Ubuntu's `+esm3`, `~esm1` suffixes) still get cited by OSV against their base CVE — that's a known OSV limitation, not a sign the package is actually unpatched. A version string carrying a distro security suffix means the fix is already applied even though OSV still lists the CVE.
+
+As of 0.9.0, the report and alert findings are additionally filtered against `apt list --upgradable` (or the equivalent for your package manager) so only packages with an actual patched version available to install are shown — a fully up-to-date box with no real upgrade path will correctly report "none found" instead of surfacing OSV's full historical CVE list. The unfiltered raw scan still lives in the cache file if you want the complete picture.
 
 ## CISA KEV cross-reference
 
