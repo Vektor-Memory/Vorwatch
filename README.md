@@ -1,4 +1,4 @@
-# Vörwatch v0.9.0
+# Vörwatch v0.9.1
 
 **Vör's Watch** — lightweight, dependency-free VPS anomaly detection in a single bash script.
 
