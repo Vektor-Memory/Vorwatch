@@ -1,7 +1,7 @@
 #!/bin/bash
 set -uo pipefail
 
-VERSION="0.9.0"
+VERSION="0.9.1"
 
 CONFIG_FILE="${VORWATCH_CONFIG:-/etc/vorwatch/vorwatch.conf}"
 [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
@@ -32,7 +32,13 @@ CRON_SCHEDULE="${VORWATCH_CRON_SCHEDULE:-*/15 * * * *}"
 SEEN_IP_TTL_DAYS="${VORWATCH_SEEN_IP_TTL_DAYS:-90}"
 DATE=$(date '+%Y-%m-%d %H:%M:%S %Z')
 
-CRITICAL_FILES="${VORWATCH_CRITICAL_FILES:-/etc/ssh/sshd_config /etc/passwd /etc/shadow /etc/crontab /etc/nginx/nginx.conf $HOME/.ssh/authorized_keys}"
+CRITICAL_FILES="${VORWATCH_CRITICAL_FILES:-/etc/ssh/sshd_config /etc/crontab /etc/nginx/nginx.conf $HOME/.ssh/authorized_keys}"
+# /etc/passwd and /etc/shadow are handled by check_account_files() below with
+# semantic diffing instead of a blunt whole-file hash, so routine package
+# installs that append a locked service account (e.g. clamav, postgres, nginx)
+# don't page the same way a real backdoor account would.
+PASSWD_SNAPSHOT="$DIR/snapshot_passwd"
+SHADOW_SNAPSHOT="$DIR/snapshot_shadow"
 
 # --- Package vulnerability scanning (optional, no API key needed) ---
 # Queries OSV.dev's free batch API with your installed package list in
@@ -313,7 +319,97 @@ cmd_baseline() {
     echo "## file_hashes"
     hash_critical_files
   } > "$BASELINE"
+  sudo cat /etc/passwd > "$PASSWD_SNAPSHOT" 2>/dev/null && chmod 600 "$PASSWD_SNAPSHOT"
+  sudo cat /etc/shadow > "$SHADOW_SNAPSHOT" 2>/dev/null && chmod 600 "$SHADOW_SNAPSHOT"
   ok "Baseline captured -> $BASELINE"
+}
+
+classify_passwd_diff() {
+  local old="$1" new="$2" added removed user uid shell bad="" routine_users=""
+  removed=$(comm -23 <(sort "$old") <(sort "$new"))
+  added=$(comm -13 <(sort "$old") <(sort "$new"))
+  if [ -n "$removed" ]; then
+    echo "URGENT|existing /etc/passwd line(s) removed or modified: $(echo "$removed" | cut -d: -f1 | tr '\n' ' ')|"
+    return
+  fi
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    user=$(echo "$line" | cut -d: -f1)
+    uid=$(echo "$line" | cut -d: -f3)
+    shell=$(echo "$line" | awk -F: '{print $NF}')
+    case "$shell" in
+      */nologin|/bin/false|/bin/sync) : ;;
+      *) bad="${bad}${user}(shell=$shell) " ;;
+    esac
+    if echo "$uid" | grep -qE '^[0-9]+$' && [ "$uid" -lt 100 ]; then
+      bad="${bad}${user}(uid=$uid<100) "
+    fi
+    routine_users="${routine_users}${user} "
+  done <<EOF2
+$added
+EOF2
+  if [ -n "$bad" ]; then
+    echo "URGENT|new /etc/passwd account(s) look suspicious (human shell or reserved uid): $bad|"
+  elif [ -n "$added" ]; then
+    echo "ROUTINE|new service account(s) appended: ${routine_users}|${routine_users}"
+  else
+    echo "ROUTINE|no change|"
+  fi
+}
+
+classify_shadow_diff() {
+  local old="$1" new="$2" routine_users="$3" added removed user bad=""
+  removed=$(comm -23 <(sort "$old") <(sort "$new"))
+  added=$(comm -13 <(sort "$old") <(sort "$new"))
+  if [ -n "$removed" ]; then
+    echo "URGENT|existing /etc/shadow line(s) changed (password/hash modified): $(echo "$removed" | cut -d: -f1 | tr '\n' ' ')"
+    return
+  fi
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    user=$(echo "$line" | cut -d: -f1)
+    case " $routine_users " in
+      *" $user "*) : ;;
+      *) bad="${bad}${user} " ;;
+    esac
+  done <<EOF2
+$added
+EOF2
+  if [ -n "$bad" ]; then
+    echo "URGENT|new /etc/shadow entry not matched to a routine new account: $bad"
+  else
+    echo "ROUTINE|no unexplained change"
+  fi
+}
+
+check_account_files() {
+  [ -f "$PASSWD_SNAPSHOT" ] && [ -f "$SHADOW_SNAPSHOT" ] || return
+  local cur_p cur_s result_p status_p reason_p routine_users result_s status_s reason_s
+  cur_p=$(mktemp); cur_s=$(mktemp)
+  sudo cat /etc/passwd > "$cur_p" 2>/dev/null
+  sudo cat /etc/shadow > "$cur_s" 2>/dev/null
+  chmod 600 "$cur_p" "$cur_s" 2>/dev/null
+
+  result_p=$(classify_passwd_diff "$PASSWD_SNAPSHOT" "$cur_p")
+  status_p=$(echo "$result_p" | cut -d'|' -f1)
+  reason_p=$(echo "$result_p" | cut -d'|' -f2)
+  routine_users=$(echo "$result_p" | cut -d'|' -f3)
+
+  result_s=$(classify_shadow_diff "$SHADOW_SNAPSHOT" "$cur_s" "$routine_users")
+  status_s=$(echo "$result_s" | cut -d'|' -f1)
+  reason_s=$(echo "$result_s" | cut -d'|' -f2)
+
+  [ "$status_p" = "URGENT" ] && alert "$reason_p"
+  [ "$status_s" = "URGENT" ] && alert "$reason_s"
+
+  if [ "$status_p" != "URGENT" ] && [ "$status_s" != "URGENT" ]; then
+    if [ "$reason_p" != "no change" ] || [ "$reason_s" != "no unexplained change" ]; then
+      echo "[$DATE] ROUTINE: passwd: ${reason_p} | shadow: ${reason_s}" >> "$LOG"
+      cp "$cur_p" "$PASSWD_SNAPSHOT"; chmod 600 "$PASSWD_SNAPSHOT"
+      cp "$cur_s" "$SHADOW_SNAPSHOT"; chmod 600 "$SHADOW_SNAPSHOT"
+    fi
+  fi
+  rm -f "$cur_p" "$cur_s"
 }
 
 check_listening_ports() {
@@ -568,6 +664,7 @@ cmd_check() {
   refresh_trusted_cidrs
   check_listening_ports
   check_file_integrity
+  check_account_files
   check_outbound_first_seen
   check_process_tree
   check_recent_auth_against_blocklist
