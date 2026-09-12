@@ -20,6 +20,10 @@ SEEN_DOMAINS="$DIR/seen-domains.txt"
 BLOCKLIST="$DIR/blocklist-cache.txt"
 BLOCKLIST_URL="${VORWATCH_BLOCKLIST_URL:-https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset}"
 BLOCKLIST_AGE_MAX="${VORWATCH_BLOCKLIST_AGE_MAX:-86400}"
+CROWDSEC_API_KEY="${VORWATCH_CROWDSEC_API_KEY:-}"
+CROWDSEC_BLOCKLIST_ID="${VORWATCH_CROWDSEC_BLOCKLIST_ID:-}"
+CROWDSEC_BLOCKLIST="$DIR/crowdsec-blocklist-cache.txt"
+CROWDSEC_BLOCKLIST_AGE_MAX="${VORWATCH_CROWDSEC_BLOCKLIST_AGE_MAX:-86400}"
 
 # --- Trusted outbound CIDR allowlist (optional) ---
 # Sites fronted by a CDN/proxy (Cloudflare, etc.) or that routinely call
@@ -218,9 +222,22 @@ refresh_blocklist() {
   fi
 }
 
-ip_in_blocklist() {
-  local ip="$1"
-  [ -f "$BLOCKLIST" ] || return 1
+refresh_crowdsec_blocklist() {
+  [ -n "$CROWDSEC_API_KEY" ] && [ -n "$CROWDSEC_BLOCKLIST_ID" ] || return
+  if [ ! -f "$CROWDSEC_BLOCKLIST" ] || [ $(( $(date +%s) - $(stat -c %Y "$CROWDSEC_BLOCKLIST" 2>/dev/null || echo 0) )) -gt "$CROWDSEC_BLOCKLIST_AGE_MAX" ]; then
+    curl -s --max-time 15 -H "x-api-key: $CROWDSEC_API_KEY" \
+      "https://admin.api.crowdsec.net/v1/blocklists/$CROWDSEC_BLOCKLIST_ID/download" \
+      -o "$CROWDSEC_BLOCKLIST.tmp" 2>/dev/null
+    if [ -s "$CROWDSEC_BLOCKLIST.tmp" ]; then
+      grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?' "$CROWDSEC_BLOCKLIST.tmp" | sort -u > "$CROWDSEC_BLOCKLIST"
+      rm -f "$CROWDSEC_BLOCKLIST.tmp"
+    fi
+  fi
+}
+
+_ip_in_cidr_file() {
+  local ip="$1" file="$2"
+  [ -f "$file" ] || return 1
   awk -v target="$ip" '
     function ip2int(ip,   a,n) {
       n = split(ip, a, ".")
@@ -245,7 +262,14 @@ ip_in_blocklist() {
       if (t >= n && t < n + size) { found = 1; exit }
     }
     END { exit (found ? 0 : 1) }
-  ' "$BLOCKLIST"
+  ' "$file"
+}
+
+ip_in_blocklist() {
+  local ip="$1"
+  _ip_in_cidr_file "$ip" "$BLOCKLIST" && return 0
+  _ip_in_cidr_file "$ip" "$CROWDSEC_BLOCKLIST" && return 0
+  return 1
 }
 
 # Merges an optional fetched URL (e.g. Cloudflare's published IP ranges)
@@ -754,6 +778,9 @@ check_nginx_anomalies() {
     if [ "$hv_hash" != "$prev_hv" ]; then
       echo "$hv_hash" > "$HIGH_VALUE_404_STATE"
       alert "CRITICAL: Targeted probe for high-value path detected: $(echo "$hv_hits" | tr '\n' ' | ')"
+      echo "$hv_hits" | awk '{print $1}' | sort -u | while read -r ip; do
+        log_ban_candidate "$ip" "high-value-secret-file-probe"
+      done
     fi
   fi
 
@@ -764,8 +791,18 @@ check_nginx_anomalies() {
       [ -z "$ip" ] && continue
       ip_in_trusted "$ip" && continue
       alert "CRITICAL: Autonomous/Adaptive scan detected. IP $ip hit $count distinct missing or forbidden paths within the log window."
+      log_ban_candidate "$ip" "adaptive-scan-velocity"
     done <<< "$adaptive_scanners"
   fi
+}
+
+IPBAN_LOG="${VORWATCH_IPBAN_LOG:-/var/log/vorwatch-actionable.log}"
+
+log_ban_candidate() {
+  local ip="$1" reason="$2"
+  [ -n "$ip" ] || return
+  ip_in_trusted "$ip" && return
+  echo "$(date -u '+%Y-%m-%d %H:%M:%S') IP_BAN_CANDIDATE ip=$ip reason=\"$reason\"" >> "$IPBAN_LOG" 2>/dev/null
 }
 
 check_ssrf_probes() {
@@ -782,6 +819,9 @@ check_ssrf_probes() {
   if [ "$new_hash" != "$prev_hash" ]; then
     echo "$new_hash" > "$state_file"
     alert "CRITICAL: SSRF / cloud-metadata probe detected: $(echo "$hits" | tr '\n' ' | ')"
+    echo "$hits" | awk '{print $1}' | sort -u | while read -r ip; do
+      log_ban_candidate "$ip" "ssrf-cloud-metadata-probe"
+    done
   fi
 }
 
@@ -847,6 +887,7 @@ check_vulnerabilities() {
 cmd_check() {
   RUN_ALERTS=""
   refresh_blocklist
+  refresh_crowdsec_blocklist
   refresh_trusted_cidrs
   check_listening_ports
   check_file_integrity
@@ -1538,6 +1579,15 @@ Noise reduction / signal quality (all optional):
                                      refreshed every VORWATCH_TRUSTED_CIDRS_AGE_MAX
                                      seconds (default 7 days)
   VORWATCH_TRUSTED_CIDRS_AGE_MAX    default 604800 (7 days)
+  VORWATCH_CROWDSEC_API_KEY         CrowdSec Service API key (from
+                                     console.crowdsec.net -> Settings ->
+                                     Service API Keys). Unset = feature
+                                     is a no-op, no network calls made.
+  VORWATCH_CROWDSEC_BLOCKLIST_ID    ID of a blocklist you're subscribed
+                                     to in the CrowdSec console (Blocklists
+                                     tab). Feeds into the same IP-reputation
+                                     check as the firehol blocklist.
+  VORWATCH_CROWDSEC_BLOCKLIST_AGE_MAX  default 86400 (24h) - re-fetch interval
   VORWATCH_KNOWN_BOT_UA_REGEX       override the built-in list of known
                                      good crawler user-agents (Googlebot,
                                      GPTBot, ClaudeBot, etc.) annotated
