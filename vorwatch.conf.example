@@ -71,3 +71,36 @@ VORWATCH_CRON_SCHEDULE="*/15 * * * *"
 # domain tracking, the same pattern used for outbound IPs.
 # VORWATCH_DNS_LOG="/var/log/dnsmasq.log"
 # VORWATCH_DNS_WINDOW_LINES=2000
+
+# --- Optional: CISA KEV cross-reference ---
+# On by default. OSV.dev returns every historical CVE/USN ever filed
+# against a package version, including ancient/low-severity/already-fixed
+# entries -- that can mean 1000+ IDs on a fully patched box. This cross-
+# references those IDs against CISA's Known Exploited Vulnerabilities
+# catalog (free, no key, actively maintained) so the report can separate
+# "OSV found something historical" from "this is confirmed being
+# exploited in the wild right now" -- the latter is what actually
+# deserves your attention.
+# VORWATCH_KEV_SCAN="true"
+# VORWATCH_KEV_CACHE_TTL_HOURS=24
+
+# --- Optional: trusted outbound CIDR allowlist ---
+# Sites behind a CDN/proxy generate constant "first-seen outbound IP"
+# noise for connections to the CDN's own rotating edge ranges -- that's
+# not suspicious, it's just infrastructure. List CIDRs/IPs here (or point
+# at a URL, e.g. Cloudflare's published ranges) to silence first-seen
+# alerts for known-good infrastructure. Trusted IPs are still recorded
+# for later review, they just never alert.
+# VORWATCH_TRUSTED_CIDRS="10.0.0.0/8,203.0.113.5"
+# VORWATCH_TRUSTED_CIDRS_URL="https://www.cloudflare.com/ips-v4"
+# VORWATCH_TRUSTED_CIDRS_AGE_MAX=604800
+
+# --- Optional: known-bot annotation on nginx top-5 source IPs ---
+# AbuseIPDB risk scores reflect the reputation of the IP's /24 or ASN,
+# not the specific request pattern -- large cloud ranges (AWS, Azure,
+# GCP) that host legitimate crawlers alongside bad actors often score
+# misleadingly high. This annotates a recognized crawler name (from the
+# dominant user-agent) next to the IP when one matches, so a risk-4
+# GPTBot doesn't read the same as a risk-4 unknown scanner without
+# checking the log yourself.
+# VORWATCH_KNOWN_BOT_UA_REGEX="Googlebot|bingbot|GPTBot|ClaudeBot|..."
