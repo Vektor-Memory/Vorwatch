@@ -865,23 +865,33 @@ check_cloudflare_edge_probes() {
     -H "Content-Type: application/json" \
     --data "$gql_query" 2>/dev/null)
   [ -n "$resp" ] || return
-  hits=$(HV_PATTERN="$HIGH_VALUE_404_TARGETS" python3 -c "
+  local py_out row_count
+  py_out=$(HV_PATTERN="$HIGH_VALUE_404_TARGETS" python3 -c "
 import json, sys, re, os
 try:
     d = json.load(sys.stdin)
     zones = d.get('data', {}).get('viewer', {}).get('zones', [])
     pat = re.compile(os.environ['HV_PATTERN'])
     out = []
+    total = 0
     for z in zones:
-        for g in z.get('httpRequestsAdaptiveGroups', []):
+        groups = z.get('httpRequestsAdaptiveGroups', [])
+        total += len(groups)
+        for g in groups:
             dim = g.get('dimensions', {})
             path = dim.get('clientRequestPath', '')
             if path and pat.search(path):
                 out.append(dim.get('clientIP', '') + ' ' + path)
+    print('ROWCOUNT:' + str(total))
     print(chr(10).join(sorted(set(out))))
 except Exception:
-    pass
+    print('ROWCOUNT:0')
 " <<< "$resp" 2>/dev/null)
+  row_count=$(echo "$py_out" | head -1 | sed 's/^ROWCOUNT://')
+  hits=$(echo "$py_out" | tail -n +2)
+  if [ "${row_count:-0}" -ge 1000 ] 2>/dev/null; then
+    echo "[$DATE] WARNING: Cloudflare edge-probe query hit the 1000-row cap (no pagination) -- results for this window may be truncated" | tee -a "$LOG" >/dev/null
+  fi
   [ -n "$hits" ] || return
   local state_file="$CF_EDGE_STATE" new_hash prev_hash
   new_hash=$(echo -n "$hits" | sha256sum | awk '{print $1}')
