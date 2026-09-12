@@ -2,6 +2,20 @@
 
 All notable changes to Vörwatch are documented here.
 
+## [0.10.2] - 2026-09-12
+
+### Fixed
+- **File integrity check false positive on authorized_keys** -
+  `CRITICAL_FILES` resolved `$HOME/.ssh/authorized_keys` using the
+  shell's `$HOME`, which differs depending on invocation context
+  (`/home/ubuntu` under cron, `/root` under `sudo vorwatch check`).
+  Running the check manually with `sudo` after a baseline captured
+  without it (or vice versa) compared two genuinely different file
+  paths and alerted a false "critical file changed". Now resolves the
+  real user's home directory once via
+  `getent passwd "${SUDO_USER:-$(id -un)}"`, stable regardless of how
+  the check is invoked.
+
 ## [0.10.1] - 2026-09-12
 
 ### Added
