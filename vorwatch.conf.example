@@ -104,3 +104,14 @@ VORWATCH_CRON_SCHEDULE="*/15 * * * *"
 # GPTBot doesn't read the same as a risk-4 unknown scanner without
 # checking the log yourself.
 # VORWATCH_KNOWN_BOT_UA_REGEX="Googlebot|bingbot|GPTBot|ClaudeBot|..."
+
+# Cloudflare edge-blocked probe detector (optional, off by default).
+# Queries the Cloudflare GraphQL Analytics API for requests Cloudflare
+# blocked at the edge (4xx) that never reached your origin nginx logs,
+# and matches them against the same high-value secret-path signatures
+# used by the weighted 404 scoring check. No-op with zero network calls
+# until both values below are set.
+# VORWATCH_CF_API_TOKEN="<token with Zone > Analytics:Read scope>"
+# VORWATCH_CF_ZONE_ID="<your Cloudflare zone ID>"
+# VORWATCH_CF_EDGE_SCAN=true
+# VORWATCH_CF_EDGE_WINDOW_MIN=15
