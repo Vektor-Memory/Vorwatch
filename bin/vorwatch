@@ -1,7 +1,7 @@
 #!/bin/bash
 set -uo pipefail
 
-VERSION="0.10.0"
+VERSION="0.10.1"
 
 CONFIG_FILE="${VORWATCH_CONFIG:-/etc/vorwatch/vorwatch.conf}"
 [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
@@ -222,16 +222,36 @@ refresh_blocklist() {
   fi
 }
 
+# Supports one or more comma-separated blocklist IDs (VORWATCH_CROWDSEC_BLOCKLIST_ID).
+# Each subscribed blocklist is downloaded separately and merged into one
+# cache file, same "many sources -> one CIDR file" pattern as the trusted-
+# CIDR allowlist. A 403 on any individual ID (not subscribed, or wrong key
+# type -- needs a Service API Key from console.crowdsec.net -> Settings ->
+# Service API Keys) is skipped rather than aborting the whole refresh, so
+# one bad/unsubscribed ID doesn't take down IDs that do work.
 refresh_crowdsec_blocklist() {
   [ -n "$CROWDSEC_API_KEY" ] && [ -n "$CROWDSEC_BLOCKLIST_ID" ] || return
   if [ ! -f "$CROWDSEC_BLOCKLIST" ] || [ $(( $(date +%s) - $(stat -c %Y "$CROWDSEC_BLOCKLIST" 2>/dev/null || echo 0) )) -gt "$CROWDSEC_BLOCKLIST_AGE_MAX" ]; then
-    curl -s --max-time 15 -H "x-api-key: $CROWDSEC_API_KEY" \
-      "https://admin.api.crowdsec.net/v1/blocklists/$CROWDSEC_BLOCKLIST_ID/download" \
-      -o "$CROWDSEC_BLOCKLIST.tmp" 2>/dev/null
+    local id merged=""
+    echo "$CROWDSEC_BLOCKLIST_ID" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | grep -v '^$' | while read -r id; do
+      local http_code
+      http_code=$(curl -s --max-time 15 -H "x-api-key: $CROWDSEC_API_KEY" \
+        -w "%{http_code}" \
+        "https://admin.api.crowdsec.net/v1/blocklists/$id/download" \
+        -o "$CROWDSEC_BLOCKLIST.part.$id" 2>/dev/null)
+      if [ "$http_code" != "200" ]; then
+        rm -f "$CROWDSEC_BLOCKLIST.part.$id"
+        continue
+      fi
+    done
+    cat "$CROWDSEC_BLOCKLIST".part.* 2>/dev/null | \
+      grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?' | sort -u > "$CROWDSEC_BLOCKLIST.tmp"
     if [ -s "$CROWDSEC_BLOCKLIST.tmp" ]; then
-      grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?' "$CROWDSEC_BLOCKLIST.tmp" | sort -u > "$CROWDSEC_BLOCKLIST"
+      mv "$CROWDSEC_BLOCKLIST.tmp" "$CROWDSEC_BLOCKLIST"
+    else
       rm -f "$CROWDSEC_BLOCKLIST.tmp"
     fi
+    rm -f "$CROWDSEC_BLOCKLIST".part.*
   fi
 }
 
@@ -825,6 +845,54 @@ check_ssrf_probes() {
   fi
 }
 
+
+VORWATCH_CF_EDGE_SCAN="${VORWATCH_CF_EDGE_SCAN:-true}"
+CF_EDGE_STATE="$DIR/cf-edge-state.txt"
+CF_EDGE_WINDOW_MIN="${VORWATCH_CF_EDGE_WINDOW_MIN:-15}"
+
+check_cloudflare_edge_probes() {
+  [ "$VORWATCH_CF_EDGE_SCAN" = "true" ] || return
+  [ -n "$VORWATCH_CF_API_TOKEN" ] && [ -n "$VORWATCH_CF_ZONE_ID" ] || return
+  local since until resp hits
+  since=$(date -u -d "-${CF_EDGE_WINDOW_MIN} minutes" +%Y-%m-%dT%H:%M:%SZ)
+  until=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  local gql_query
+  gql_query=$(printf '{"query":"query { viewer { zones(filter: {zoneTag: \\"%s\\"}) { httpRequestsAdaptiveGroups(limit: 1000, filter: {datetime_geq: \\"%s\\", datetime_leq: \\"%s\\", edgeResponseStatus_geq: 400}) { dimensions { clientIP clientRequestPath edgeResponseStatus } } } } }"}' \
+    "$VORWATCH_CF_ZONE_ID" "$since" "$until")
+  resp=$(curl -s --max-time 10 -X POST "https://api.cloudflare.com/client/v4/graphql" \
+    -H "Authorization: Bearer $VORWATCH_CF_API_TOKEN" \
+    -H "Content-Type: application/json" \
+    --data "$gql_query" 2>/dev/null)
+  [ -n "$resp" ] || return
+  hits=$(HV_PATTERN="$HIGH_VALUE_404_TARGETS" python3 -c "
+import json, sys, re, os
+try:
+    d = json.load(sys.stdin)
+    zones = d.get('data', {}).get('viewer', {}).get('zones', [])
+    pat = re.compile(os.environ['HV_PATTERN'])
+    out = []
+    for z in zones:
+        for g in z.get('httpRequestsAdaptiveGroups', []):
+            dim = g.get('dimensions', {})
+            path = dim.get('clientRequestPath', '')
+            if path and pat.search(path):
+                out.append(dim.get('clientIP', '') + ' ' + path)
+    print(chr(10).join(sorted(set(out))))
+except Exception:
+    pass
+" <<< "$resp" 2>/dev/null)
+  [ -n "$hits" ] || return
+  local state_file="$CF_EDGE_STATE" new_hash prev_hash
+  new_hash=$(echo -n "$hits" | sha256sum | awk '{print $1}')
+  prev_hash=$(cat "$state_file" 2>/dev/null || true)
+  if [ "$new_hash" != "$prev_hash" ]; then
+    echo "$new_hash" > "$state_file"
+    alert "CRITICAL: Cloudflare edge-blocked high-value probe detected (invisible to origin nginx logs): $(echo "$hits" | tr '\n' ' | ')"
+    echo "$hits" | awk '{print $1}' | sort -u | while read -r ip; do
+      log_ban_candidate "$ip" "cf-edge-secret-probe"
+    done
+  fi
+}
 check_ua_rotation() {
   [ "$UA_ROTATION_SCAN" = "true" ] || return
   [ -r "$NGINX_ACCESS_LOG_FOR_CHECK" ] || return
@@ -901,6 +969,7 @@ cmd_check() {
   check_recent_auth_against_blocklist
   check_nginx_anomalies
   check_ssrf_probes
+  check_cloudflare_edge_probes
   check_ua_rotation
   check_cis_benchmarks
   check_rootkit

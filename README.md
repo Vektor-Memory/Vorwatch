@@ -43,6 +43,7 @@ Sites behind a CDN or proxy can also configure a **trusted outbound CIDR allowli
 - **DNS query anomaly detection** *(optional, off by default)* — first-seen queried domain tracking, same pattern as outbound IPs, if you point it at a resolver log
 - **Trusted outbound CIDR allowlist** *(optional)* — mark known-good infrastructure (your CDN's edge ranges, mail relay, etc.) so first-seen-outbound-IP alerts stop firing on traffic that isn't actually suspicious; can auto-fetch from a URL (e.g. Cloudflare's published ranges) or be set inline
 - **Known-bot annotation** *(optional)* — tags nginx top-5 source IPs with a recognized crawler name (Googlebot, GPTBot, ClaudeBot, etc.) when the user-agent matches, since large cloud IP ranges that host legitimate crawlers alongside bad actors can score misleadingly high on reputation alone
+- **Cloudflare edge-blocked probe detector** *(optional, off by default)* -- queries the Cloudflare GraphQL Analytics API for edge-blocked (4xx) requests matching high-value secret paths that never reached your origin nginx logs, via `VORWATCH_CF_API_TOKEN` / `VORWATCH_CF_ZONE_ID`
 - **Optional: IP reputation scoring** — grades your top-5 nginx source IPs 1–5 for risk via [AbuseIPDB](https://www.abuseipdb.com) (bring your own free-tier key)
 - **Optional: email notifications** — urgent alerts (blocklist hits, file tampering, attack patterns, rootkit hits, KEV matches) send immediately; everything else lands in a scheduled digest, via [Resend](https://resend.com) (bring your own free-tier key)
 - **Zero daemon, zero database** — one bash file, runs off cron, state lives in flat files
@@ -142,6 +143,10 @@ All settings live in `/etc/vorwatch/vorwatch.conf` — plain shell variable assi
 | `VORWATCH_TRUSTED_CIDRS_URL` | unset | Optional URL to fetch a trusted CIDR list from (e.g. Cloudflare's published ranges), merged with `VORWATCH_TRUSTED_CIDRS` |
 | `VORWATCH_TRUSTED_CIDRS_AGE_MAX` | `604800` | Seconds before the fetched trusted CIDR list re-downloads (default 7 days) |
 | `VORWATCH_KNOWN_BOT_UA_REGEX` | see script | Override the built-in list of known-good crawler user-agents annotated next to nginx top-5 source IPs |
+| `VORWATCH_CF_API_TOKEN` | unset | Cloudflare API token (Zone > Analytics:Read) -- enables the edge-blocked probe detector. Unset = no-op, no network calls |
+| `VORWATCH_CF_ZONE_ID` | unset | Cloudflare zone ID for the site being monitored |
+| `VORWATCH_CF_EDGE_SCAN` | `true` | Toggles the edge-probe check on/off (only active if the token/zone above are set) |
+| `VORWATCH_CF_EDGE_WINDOW_MIN` | `15` | Minutes of edge traffic to query per check |
 
 ## IP reputation scoring
 

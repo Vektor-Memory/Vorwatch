@@ -2,6 +2,22 @@
 
 All notable changes to Vörwatch are documented here.
 
+## [0.10.1] - 2026-09-12
+
+### Added
+- **Cloudflare edge-blocked probe detector** - queries the Cloudflare
+  GraphQL Analytics API (`httpRequestsAdaptiveGroups`, free on all
+  plans) for requests Cloudflare blocked at the edge (4xx) that never
+  reached origin nginx logs, and matches them against the same
+  `HIGH_VALUE_404_TARGETS` signature list used by the weighted
+  secret-filename scoring check. Closes a real blind spot: an attacker
+  sweep can be fully edge-blocked and completely invisible to every
+  log-based check in this project. Configured via
+  `VORWATCH_CF_API_TOKEN` / `VORWATCH_CF_ZONE_ID` (both unset by
+  default - the check is a no-op with no network calls until both are
+  set). Degrades gracefully on API/auth failure, same pattern as the
+  CrowdSec integration.
+
 ## [0.10.0] - 2026-09-12
 
 ### Added
