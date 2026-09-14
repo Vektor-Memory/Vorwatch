@@ -273,7 +273,7 @@ If email fails — bad key, network hiccup, whatever — it fails silently and n
 -- nginx (current log file only) --
   Requests logged:        449
   Top 5 source IPs by request count (risk 1-5, 5=critical, via AbuseIPDB):
-    115.186.231.43       35 requests  [risk 1]
+    115.187.232.43       35 requests  [risk 1]
     74.7.243.194         38 requests  [risk 4] [bot: GPTBot]
   ...
 
