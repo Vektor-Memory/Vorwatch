@@ -154,7 +154,7 @@ Scoped deliberately narrow: only your nginx **top-5 source IPs by request count*
 
 ```
 Top 5 source IPs by request count (risk 1-5, 5=critical, via AbuseIPDB):
-    115.186.231.43         35 requests  [risk 1]
+    115.187.232.43         35 requests  [risk 1]
     74.7.243.194           38 requests  [risk 4] [bot: GPTBot]
     3.99.128.211           17 requests  [risk 2]
     216.73.217.6           8 requests   [risk 5]
