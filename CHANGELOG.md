@@ -2,7 +2,19 @@
 
 All notable changes to Vörwatch are documented here.
 
-## [0.10.2] - 2026-09-12
+## [0.10.3] - 2026-09-14
+
+### Added
+- **`VORWATCH_REPORT_EXCLUDE_IPS`** — comma-separated IPs excluded from the
+  nginx top-5 source IP list in `vorwatch report`, so a known-safe IP
+  (e.g. your own) doesn't crowd out real signal in the report.
+
+### Fixed
+- README example output used a sample IP sharing the real site owner's
+  `/24` subnet, differing only in the last octet — replaced with a fully
+  unrelated fictional address.
+
+## [0.10.2] - 2026-09-13
 
 ### Fixed
 - **File integrity check false positive on authorized_keys** -
@@ -15,6 +27,10 @@ All notable changes to Vörwatch are documented here.
   real user's home directory once via
   `getent passwd "${SUDO_USER:-$(id -un)}"`, stable regardless of how
   the check is invoked.
+- `VORWATCH_CROWDSEC_BLOCKLIST_ID` now accepts multiple comma-separated
+  blocklist IDs, downloaded and merged independently — a 403 on one
+  unsubscribed/mistyped ID no longer aborts the refresh for IDs that do
+  work.
 
 ## [0.10.1] - 2026-09-12
 

@@ -1,4 +1,4 @@
-# Vörwatch VERSION 0.10.2
+# Vörwatch v0.10.3
 
 **Vör's Watch** — lightweight, dependency-free VPS anomaly detection in a single bash script.
 
@@ -147,6 +147,7 @@ All settings live in `/etc/vorwatch/vorwatch.conf` — plain shell variable assi
 | `VORWATCH_CF_ZONE_ID` | unset | Cloudflare zone ID for the site being monitored |
 | `VORWATCH_CF_EDGE_SCAN` | `true` | Toggles the edge-probe check on/off (only active if the token/zone above are set) |
 | `VORWATCH_CF_EDGE_WINDOW_MIN` | `15` | Minutes of edge traffic to query per check |
+| `VORWATCH_REPORT_EXCLUDE_IPS` | unset | Comma-separated IPs to exclude from the nginx top-5 source IP list in reports (e.g. your own known-safe IP, so it doesn't crowd out real signal) |
 
 ## IP reputation scoring
 

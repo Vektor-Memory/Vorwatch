@@ -115,3 +115,9 @@ VORWATCH_CRON_SCHEDULE="*/15 * * * *"
 # VORWATCH_CF_ZONE_ID="<your Cloudflare zone ID>"
 # VORWATCH_CF_EDGE_SCAN=true
 # VORWATCH_CF_EDGE_WINDOW_MIN=15
+
+# --- Optional: exclude specific IPs from the nginx top-5 report list ---
+# Comma-separated IPs (e.g. your own known-safe IP, or a monitoring probe)
+# that should never take up a slot in the nginx top-5 source IP list in
+# `vorwatch report`. Doesn't affect any other check or alert.
+# VORWATCH_REPORT_EXCLUDE_IPS="203.0.113.5,203.0.113.6"

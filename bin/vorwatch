@@ -1,7 +1,7 @@
 #!/bin/bash
 set -uo pipefail
 
-VERSION="0.10.2"
+VERSION="0.10.3"
 
 CONFIG_FILE="${VORWATCH_CONFIG:-/etc/vorwatch/vorwatch.conf}"
 [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
@@ -761,6 +761,7 @@ NGINX_WINDOW_LINES="${VORWATCH_NGINX_WINDOW_LINES:-3000}"
 # matches, so a risk-4 GPTBot doesn't read the same as a risk-4 unknown
 # scanner without more digging.
 KNOWN_BOT_UA_REGEX="${VORWATCH_KNOWN_BOT_UA_REGEX:-Googlebot|bingbot|Slurp|DuckDuckBot|Baiduspider|YandexBot|GPTBot|ChatGPT-User|OAI-SearchBot|ClaudeBot|anthropic-ai|PerplexityBot|CCBot|facebookexternalhit|Twitterbot|LinkedInBot|AhrefsBot|SemrushBot|MJ12bot|PetalBot|Applebot|UptimeRobot}"
+REPORT_EXCLUDE_IPS="${VORWATCH_REPORT_EXCLUDE_IPS:-}"
 HIGH_VALUE_404_TARGETS="${VORWATCH_HIGH_VALUE_404_TARGETS:-service-account\.json|\.env$|\.env\.production|terraform\.tfstate|firebase-adminsdk|id_rsa$|\.aws/credentials|docker\.sock|private\.key$}"
 HIGH_VALUE_404_STATE="$DIR/high-value-404-state.txt"
 SSRF_SCAN="${VORWATCH_SSRF_SCAN:-true}"
@@ -1257,7 +1258,11 @@ report_nginx_text() {
   awk '{print $9}' "$NGINX_ACCESS_LOG" 2>/dev/null | grep -E '^[0-9]{3}$' | sort | uniq -c | sort -rn | head -6 | \
     awk '{printf "    %-5s %s\n", $2, $1}'
   echo "  Top 5 source IPs by request count (risk 1-5, 5=critical, via AbuseIPDB):"
-  awk '{print $1}' "$NGINX_ACCESS_LOG" 2>/dev/null | sort | uniq -c | sort -rn | head -5 | \
+  local exclude_filter="cat"
+  if [ -n "$REPORT_EXCLUDE_IPS" ]; then
+    exclude_filter="grep -vFf <(echo \"$REPORT_EXCLUDE_IPS\" | tr ',' '\n')"
+  fi
+  awk '{print $1}' "$NGINX_ACCESS_LOG" 2>/dev/null | eval "$exclude_filter" | sort | uniq -c | sort -rn | head -5 | \
   while read -r count ip; do
     [ -z "$ip" ] && continue
     local risk bot_tag ua
